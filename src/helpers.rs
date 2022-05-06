@@ -15,7 +15,6 @@ use windows_sys::Win32::Foundation::UNICODE_STRING;
 const SYSCALL_TABLE_SIZE: usize = 512;
 const LIBRARY_CONVERSION_BUFFER_SIZE: usize = 64;
 
-#[inline(never)]
 pub const fn fnv1a_hash_32_wstr(wchars: &[u16]) -> u32 {
 	const FNV_OFFSET_BASIS_32: u32 = 0x811c9dc5;
 	const FNV_PRIME_32: u32 = 0x01000193;
@@ -32,7 +31,6 @@ pub const fn fnv1a_hash_32_wstr(wchars: &[u16]) -> u32 {
 	hash
 }
 
-#[inline(never)]
 pub const fn fnv1a_hash_32(chars: &[u8]) -> u32 {
 	const FNV_OFFSET_BASIS_32: u32 = 0x811c9dc5;
 	const FNV_PRIME_32: u32 = 0x01000193;
@@ -67,7 +65,6 @@ pub fn simple_memset_u32(dest: &mut [MaybeUninit<u32>], value: u32) {
 	}
 }
 
-#[inline(never)]
 pub fn ascii_wstr_eq(ascii: &CStr, wstr: &[u16]) -> bool {
 	// Check if the lengths are equal
 	if wstr.len() != ascii.to_bytes().len() {
@@ -87,7 +84,6 @@ pub fn ascii_wstr_eq(ascii: &CStr, wstr: &[u16]) -> bool {
 	true
 }
 
-#[inline(never)]
 pub fn ascii_ascii_eq(a: &[u8], b: &[u8]) -> bool {
 	// Check if the lengths are equal
 	if a.len() != b.len() {
@@ -106,7 +102,6 @@ pub fn ascii_ascii_eq(a: &[u8], b: &[u8]) -> bool {
 	true
 }
 
-#[inline(never)]
 pub fn find_pe(start: usize) -> Result<(*mut u8, PeHeaders)> {
 	let mut page_aligned = start & !0xfff;
 	loop {
@@ -121,7 +116,6 @@ pub fn find_pe(start: usize) -> Result<(*mut u8, PeHeaders)> {
 	}
 }
 
-#[inline(never)]
 pub fn find_loaded_module_by_hash(ldr: &PEB_LDR_DATA, hash: u32) -> Result<*mut u8> {
 	// Get initial entry in the list
 	let mut ldr_data_ptr = ldr.InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY;
@@ -148,7 +142,6 @@ pub fn find_loaded_module_by_hash(ldr: &PEB_LDR_DATA, hash: u32) -> Result<*mut 
 	Err(Error::ModuleByHash)
 }
 
-#[inline(never)]
 pub fn find_loaded_module_by_ascii(ldr: &PEB_LDR_DATA, ascii: *const i8) -> Result<*mut u8> {
 	let ascii = unsafe { CStr::from_ptr(ascii) };
 
@@ -175,7 +168,6 @@ pub fn find_loaded_module_by_ascii(ldr: &PEB_LDR_DATA, ascii: *const i8) -> Resu
 	Err(Error::ModuleByAscii)
 }
 
-#[inline(never)]
 pub fn find_export_by_hash(exports: &ExportTable, base: *mut u8, hash: u32) -> Result<*mut u8> {
 	exports
 		.iter_string_addr(base)
@@ -184,7 +176,6 @@ pub fn find_export_by_hash(exports: &ExportTable, base: *mut u8, hash: u32) -> R
 		.ok_or(Error::ExportVaByHash)
 }
 
-#[inline(never)]
 pub fn find_export_by_ascii(
 	exports: &ExportTable,
 	base: *mut u8,
@@ -197,7 +188,6 @@ pub fn find_export_by_ascii(
 		.ok_or(Error::ExportVaByAscii)
 }
 
-#[inline(never)]
 pub fn get_library_base(
 	peb_ldr: &PEB_LDR_DATA,
 	library_name: *const u8,
@@ -250,7 +240,6 @@ pub fn get_library_base(
 	Ok(loaded_library_base)
 }
 
-#[inline(never)]
 pub fn syscall_table(exports: &ExportTable, base: *mut u8) -> [u32; SYSCALL_TABLE_SIZE] {
 	let mut scratch_table = [MaybeUninit::<(u32, *mut u8)>::uninit(); SYSCALL_TABLE_SIZE];
 	let mut num_syscalls = 0;
@@ -305,7 +294,6 @@ pub fn syscall_table(exports: &ExportTable, base: *mut u8) -> [u32; SYSCALL_TABL
 	output
 }
 
-#[inline(never)]
 pub fn find_syscall_by_hash(table: &[u32; SYSCALL_TABLE_SIZE], hash: u32) -> Result<u32> {
 	table
 		.iter()

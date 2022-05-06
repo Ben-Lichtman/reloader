@@ -34,9 +34,9 @@ use ntapi::{
 };
 use object::{
 	pe::{
-		ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_REL_BASED_ABSOLUTE,
-		IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
-		IMAGE_SCN_MEM_WRITE,
+		self, ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_TLS,
+		IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
+		IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
 	},
 	read::pe::{ImageNtHeaders, ImageOptionalHeader, ImageThunkData},
 	LittleEndian,
@@ -44,9 +44,12 @@ use object::{
 use wchar::wch;
 use windows_sys::Win32::{
 	Foundation::{STATUS_SUCCESS, UNICODE_STRING},
-	System::Memory::{
-		MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-		PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+	System::{
+		Memory::{
+			MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+			PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+		},
+		SystemServices::PIMAGE_TLS_CALLBACK,
 	},
 };
 
@@ -446,6 +449,23 @@ fn load() -> Result<(*mut u8, *mut u8)> {
 		return Err(Error::Flush);
 	}
 	// unsafe { ntflushinstructioncache(-1 as _, null_mut(), 0) };
+
+	// Initialise TLS callbacks
+	let tls_callbacks = unsafe { pe.data_directories.get_unchecked(IMAGE_DIRECTORY_ENTRY_TLS) };
+	let tls_dir =
+		unsafe { allocated_ptr.add(tls_callbacks.virtual_address.get(LittleEndian) as _) };
+	#[cfg(target_arch = "x86_64")]
+	let tls_dir = unsafe { &*tls_dir.cast::<pe::ImageTlsDirectory64>() };
+	#[cfg(target_arch = "x86")]
+	let tls_dir = unsafe { &*tls_dir.cast::<pe::ImageTlsDirectory32>() };
+
+	// Calling each TLS callback
+	let mut callback_addr =
+		tls_dir.address_of_call_backs.get(LittleEndian) as *const PIMAGE_TLS_CALLBACK;
+	while let Some(callback) = unsafe { *callback_addr } {
+		unsafe { callback(allocated_ptr as _, DLL_PROCESS_ATTACH, null_mut()) };
+		callback_addr = unsafe { callback_addr.add(1) };
+	}
 
 	Ok((allocated_ptr, entry_point))
 }
