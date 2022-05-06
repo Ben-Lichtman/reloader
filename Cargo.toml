@@ -1,0 +1,18 @@
+[package]
+name = "reloader"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["debug"]
+debug = []
+
+[dependencies]
+cstr_core = "0.2.5"
+ntapi = "0.3.7"
+object = { version = "0.28.3", default_features = false, features = ["read"] }
+wchar = "0.11.0"
+
+[dependencies.windows-sys]
+version = "0.34.0"
+features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_LibraryLoader"]
