@@ -3,7 +3,6 @@
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_array_assume_init)]
 #![feature(const_char_convert)]
-#![feature(asm_const)]
 
 mod error;
 mod helpers;
