@@ -28,7 +28,10 @@ use core::{
 	str::from_utf8_unchecked,
 };
 use helpers::{get_ip, get_peb};
-use ntapi::winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS};
+use ntapi::{
+	ntpsapi::PEB_LDR_DATA,
+	winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS},
+};
 use object::{
 	pe::{
 		self, ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_TLS,
@@ -44,7 +47,8 @@ use windows_sys::Win32::{
 	System::{
 		Memory::{
 			MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-			PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+			PAGE_EXECUTE_WRITECOPY, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+			PAGE_WRITECOPY,
 		},
 		SystemServices::PIMAGE_TLS_CALLBACK,
 	},
@@ -62,42 +66,15 @@ const ZWPROTECTVIRTUALMEMORY_HASH: u32 = fnv1a_hash_32("ZwProtectVirtualMemory".
 const LDRLOADDLL_HASH: u32 = fnv1a_hash_32("LdrLoadDll".as_bytes());
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn self_load() -> Result<(*mut u8, *mut u8)> {
-	let (pe_base, pe) = find_pe_base(get_ip())?;
-
-	// Locate other important data structures
-	let peb = get_peb();
-	let peb_ldr = unsafe { &*peb.Ldr };
-
-	// Traverse loaded modules to find ntdll.dll
-	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
-	let ntdll = PeHeaders::parse(ntdll_base)?;
-
-	// Locate the export table for ntdll.dll
-	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
-
-	let syscall_table = syscall_table(&ntdll_export_table, ntdll_base);
-
-	// Find some important syscall numbers
-	let sys_no_zwflushinstructioncache =
-		find_syscall_by_hash(&syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
-	let sys_no_zwallocatevirtualmemory =
-		find_syscall_by_hash(&syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
-	let sys_no_zwprotectvirtualmemory =
-		find_syscall_by_hash(&syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
-
-	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
-	let ldrloaddll = unsafe {
-		transmute::<
-			_,
-			unsafe extern "system" fn(
-				DllPath: *const u16,
-				DllCharacteristics: *const u32,
-				DllName: *const UNICODE_STRING,
-				DllHandle: *mut *mut u8,
-			) -> i32,
-		>(ldrloaddll)
-	};
+fn load_dll(
+	pe_base: *mut u8,
+	peb_ldr: &PEB_LDR_DATA,
+	allocate_memory: &dyn Fn(usize) -> Result<*mut u8>,
+	protect_memory: &dyn Fn(*mut u8, usize, PAGE_PROTECTION_FLAGS) -> Result<PAGE_PROTECTION_FLAGS>,
+	flush_instruction_cache: &dyn Fn() -> Result<()>,
+	load_child_dll: &dyn Fn(*const UNICODE_STRING) -> Result<*mut u8>,
+) -> Result<(*mut u8, *mut u8)> {
+	let pe = PeHeaders::parse(pe_base)?;
 
 	// Allocate space to map the PE into
 	let size_of_image = pe
@@ -106,27 +83,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 		.size_of_image
 		.get(LittleEndian) as usize;
 
-	let mut allocated_ptr = null_mut::<u8>();
-	let mut region_size = size_of_image as usize;
-
-	let nt_status = unsafe {
-		syscall6(
-			sys_no_zwallocatevirtualmemory,
-			-1i64 as _,
-			&mut allocated_ptr as *mut _ as _,
-			0,
-			&mut region_size as *mut _ as _,
-			(MEM_RESERVE | MEM_COMMIT) as _,
-			PAGE_READWRITE as _,
-		)
-	};
-	if nt_status != STATUS_SUCCESS as _ {
-		return Err(Error::Allocation);
-	}
-
-	if allocated_ptr.is_null() {
-		return Err(Error::Allocation);
-	}
+	let allocated_ptr = allocate_memory(size_of_image)?;
 
 	// Copy over header data
 	let header_size = pe
@@ -152,7 +109,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 		let library_name = unsafe { allocated_ptr.add(name_rva) };
 
 		// Load library if it is not already loaded and get the base
-		let loaded_library_base = get_library_base(peb_ldr, library_name as _, ldrloaddll)?;
+		let loaded_library_base = get_library_base(peb_ldr, library_name as _, load_child_dll)?;
 
 		// Find the exports of the loaded library
 		let loaded_library = PeHeaders::parse(loaded_library_base)?;
@@ -253,7 +210,8 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 					unsafe { working_buffer.split_at_mut_unchecked(dot_index + 5) };
 
 				// Load library if it is not already loaded and get the base
-				let loaded_library_base = get_library_base(peb_ldr, dll_name.as_ptr(), ldrloaddll)?;
+				let loaded_library_base =
+					get_library_base(peb_ldr, dll_name.as_ptr(), load_child_dll)?;
 
 				// Find the exports of the loaded library
 				let loaded_library = PeHeaders::parse(loaded_library_base)?;
@@ -356,22 +314,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 	}
 
 	// Set header permissions
-	let base_address = allocated_ptr;
-	let mut region_size = header_size;
-	let mut old_permissions = u32::default();
-	let nt_status = unsafe {
-		syscall5(
-			sys_no_zwprotectvirtualmemory,
-			-1i64 as _,
-			&base_address as *const _ as _,
-			&mut region_size as *mut _ as _,
-			PAGE_READONLY as _,
-			&mut old_permissions as *mut _ as _,
-		)
-	};
-	if nt_status != STATUS_SUCCESS as _ {
-		return Err(Error::Protect);
-	}
+	protect_memory(allocated_ptr, header_size, PAGE_READONLY)?;
 
 	// Set section permissions
 	pe.section_headers.iter().try_for_each(|section| {
@@ -394,22 +337,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 			(false, true, true) => PAGE_EXECUTE_WRITECOPY,
 			(true, true, true) => PAGE_EXECUTE_READWRITE,
 		};
-		let base_address = virtual_address;
-		let mut region_size = virtual_size;
-		let mut old_permissions = u32::default();
-		let nt_status = unsafe {
-			syscall5(
-				sys_no_zwprotectvirtualmemory,
-				-1i64 as _,
-				&base_address as *const _ as _,
-				&mut region_size as *mut _ as _,
-				new_permissions as _,
-				&mut old_permissions as *mut _ as _,
-			)
-		};
-		if nt_status != STATUS_SUCCESS as _ {
-			return Err(Error::Protect);
-		}
+		protect_memory(virtual_address, virtual_size as _, new_permissions)?;
 		Ok(())
 	})?;
 
@@ -423,11 +351,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 	};
 
 	// We must flush the instruction cache to avoid stale code being used which was updated by our relocation processing
-	let nt_status = unsafe { syscall3(sys_no_zwflushinstructioncache, -1i64 as _, 0, 0) };
-	if nt_status != STATUS_SUCCESS as _ {
-		return Err(Error::Flush);
-	}
-	// unsafe { ntflushinstructioncache(-1 as _, null_mut(), 0) };
+	flush_instruction_cache()?;
 
 	// Initialise TLS callbacks
 	let tls_callbacks = unsafe { pe.data_directories.get_unchecked(IMAGE_DIRECTORY_ENTRY_TLS) };
@@ -447,6 +371,119 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 	}
 
 	Ok((allocated_ptr, entry_point))
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn self_load() -> Result<(*mut u8, *mut u8)> {
+	let pe_base = find_pe_base(get_ip())?;
+
+	// Locate other important data structures
+	let peb = get_peb();
+	let peb_ldr = unsafe { &*peb.Ldr };
+
+	// Traverse loaded modules to find ntdll.dll
+	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
+	let ntdll = PeHeaders::parse(ntdll_base)?;
+
+	// Locate the export table for ntdll.dll
+	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
+
+	let syscall_table = syscall_table(&ntdll_export_table, ntdll_base);
+
+	// Find some important syscall numbers
+	let sys_no_zwallocatevirtualmemory =
+		find_syscall_by_hash(&syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
+	let sys_no_zwprotectvirtualmemory =
+		find_syscall_by_hash(&syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
+	let sys_no_zwflushinstructioncache =
+		find_syscall_by_hash(&syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
+
+	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
+	let ldrloaddll = unsafe {
+		transmute::<
+			_,
+			unsafe extern "system" fn(
+				DllPath: *const u16,
+				DllCharacteristics: *const u32,
+				DllName: *const UNICODE_STRING,
+				DllHandle: *mut *mut u8,
+			) -> i32,
+		>(ldrloaddll)
+	};
+
+	let allocate_memory = |size: usize| -> Result<*mut u8> {
+		let mut allocated_ptr = null_mut::<u8>();
+		let mut region_size = size;
+
+		let nt_status = unsafe {
+			syscall6(
+				sys_no_zwallocatevirtualmemory,
+				-1i64 as _,
+				&mut allocated_ptr as *mut _ as _,
+				0,
+				&mut region_size as *mut _ as _,
+				(MEM_RESERVE | MEM_COMMIT) as _,
+				PAGE_READWRITE as _,
+			)
+		};
+		if nt_status != STATUS_SUCCESS as _ {
+			return Err(Error::Allocation);
+		}
+
+		if allocated_ptr.is_null() {
+			return Err(Error::Allocation);
+		}
+		Ok(allocated_ptr)
+	};
+
+	let protect_memory = |base: *mut u8,
+	                      size: usize,
+	                      protection: PAGE_PROTECTION_FLAGS|
+	 -> Result<PAGE_PROTECTION_FLAGS> {
+		let base_address = base;
+		let mut region_size = size;
+		let mut old_permissions = u32::default();
+		let nt_status = unsafe {
+			syscall5(
+				sys_no_zwprotectvirtualmemory,
+				-1i64 as _,
+				&base_address as *const _ as _,
+				&mut region_size as *mut _ as _,
+				protection as _,
+				&mut old_permissions as *mut _ as _,
+			)
+		};
+		if nt_status != STATUS_SUCCESS as _ {
+			return Err(Error::Protect);
+		}
+		Ok(old_permissions)
+	};
+
+	let flush_instruction_cache = || -> Result<()> {
+		let nt_status = unsafe { syscall3(sys_no_zwflushinstructioncache, -1i64 as _, 0, 0) };
+		if nt_status != STATUS_SUCCESS as _ {
+			return Err(Error::Flush);
+		}
+		Ok(())
+	};
+
+	let load_child_dll = |unicode_string: *const UNICODE_STRING| -> Result<*mut u8> {
+		let mut module_handle = null_mut::<u8>();
+		unsafe { ldrloaddll(null_mut(), null_mut(), unicode_string, &mut module_handle) };
+		if module_handle.is_null() {
+			return Err(Error::LdrLoadDll);
+		}
+		Ok(module_handle)
+	};
+
+	load_dll(
+		pe_base,
+		peb_ldr,
+		&allocate_memory,
+		&protect_memory,
+		&flush_instruction_cache,
+		&load_child_dll,
+	)
 }
 
 #[cfg_attr(feature = "debug", inline(never))]

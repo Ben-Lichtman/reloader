@@ -6,7 +6,6 @@ use core::{
 	arch::asm,
 	ffi::CStr,
 	mem::MaybeUninit,
-	ptr::null_mut,
 	slice,
 	sync::atomic::{compiler_fence, Ordering},
 };
@@ -146,7 +145,7 @@ pub fn get_peb() -> &'static mut PEB {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn find_pe_base(start: usize) -> Result<(*mut u8, PeHeaders)> {
+pub fn find_pe_base(start: usize) -> Result<*mut u8> {
 	let mut aligned = start & !0xfff;
 	loop {
 		if aligned == 0 {
@@ -154,7 +153,7 @@ pub fn find_pe_base(start: usize) -> Result<(*mut u8, PeHeaders)> {
 		}
 
 		match PeHeaders::parse(aligned as _) {
-			Ok(pe) => break Ok((aligned as _, pe)),
+			Ok(_) => break Ok(aligned as _),
 			Err(_) => aligned -= 0x1000,
 		}
 	}
@@ -240,12 +239,7 @@ pub fn find_export_by_ascii(
 pub fn get_library_base(
 	peb_ldr: &PEB_LDR_DATA,
 	library_name: *const u8,
-	ldrloaddll: unsafe extern "system" fn(
-		DllPath: *const u16,
-		DllCharacteristics: *const u32,
-		DllName: *const UNICODE_STRING,
-		DllHandle: *mut *mut u8,
-	) -> i32,
+	load_child_dll: &dyn Fn(*const UNICODE_STRING) -> Result<*mut u8>,
 ) -> Result<*mut u8> {
 	let loaded_library_base = match find_loaded_module_by_ascii(peb_ldr, library_name as _) {
 		Ok(base) => base,
@@ -267,20 +261,7 @@ pub fn get_library_base(
 			};
 
 			// Now load the library
-			let mut module_handle = null_mut::<u8>();
-
-			unsafe {
-				ldrloaddll(
-					null_mut(),
-					null_mut(),
-					&unicode_string as _,
-					&mut module_handle,
-				)
-			};
-			if module_handle.is_null() {
-				return Err(Error::LdrLoadDll);
-			}
-			module_handle
+			load_child_dll(&unicode_string as _)?
 		}
 	};
 	if loaded_library_base.is_null() {
