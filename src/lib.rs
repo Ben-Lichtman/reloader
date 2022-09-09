@@ -12,7 +12,7 @@ mod syscall;
 use crate::{
 	error::{Error, Result},
 	helpers::{
-		find_export_by_ascii, find_export_by_hash, find_loaded_module_by_hash, find_pe,
+		find_export_by_ascii, find_export_by_hash, find_loaded_module_by_hash, find_pe_base,
 		find_syscall_by_hash, fnv1a_hash_32, fnv1a_hash_32_wstr, get_library_base, simple_memcpy,
 		syscall_table,
 	},
@@ -21,16 +21,14 @@ use crate::{
 };
 use core::{
 	arch::asm,
+	ffi::CStr,
 	mem::{size_of, transmute},
 	ptr::null_mut,
 	slice,
 	str::from_utf8_unchecked,
 };
-use cstr_core::CStr;
-use ntapi::{
-	ntpebteb::TEB,
-	winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS},
-};
+use helpers::{get_ip, get_peb};
+use ntapi::winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS};
 use object::{
 	pe::{
 		self, ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_TLS,
@@ -63,30 +61,12 @@ const ZWPROTECTVIRTUALMEMORY_HASH: u32 = fnv1a_hash_32("ZwProtectVirtualMemory".
 
 const LDRLOADDLL_HASH: u32 = fnv1a_hash_32("LdrLoadDll".as_bytes());
 
-#[inline(never)]
-fn load() -> Result<(*mut u8, *mut u8)> {
-	let rip: usize;
-	#[cfg(target_arch = "x86_64")]
-	unsafe {
-		asm!("lea {rip}, [rip]", rip = out(reg) rip)
-	};
-	#[cfg(target_arch = "x86")]
-	unsafe {
-		asm!("lea {eip}, [eip]", rip = out(reg) rip)
-	};
-	let (pe_base, pe) = find_pe(rip)?;
+#[cfg_attr(feature = "debug", inline(never))]
+fn self_load() -> Result<(*mut u8, *mut u8)> {
+	let (pe_base, pe) = find_pe_base(get_ip())?;
 
 	// Locate other important data structures
-	let teb: *mut TEB;
-	unsafe {
-		#[cfg(target_arch = "x86_64")]
-		asm!("mov {teb}, gs:[0x30]", teb = out(reg) teb);
-		#[cfg(target_arch = "x86")]
-		asm!("mov {teb}, fs:[0x18]", teb = out(reg) teb);
-	}
-	let teb = unsafe { &mut *teb };
-	let peb = unsafe { &mut *teb.ProcessEnvironmentBlock };
-
+	let peb = get_peb();
 	let peb_ldr = unsafe { &*peb.Ldr };
 
 	// Traverse loaded modules to find ntdll.dll
@@ -469,7 +449,7 @@ fn load() -> Result<(*mut u8, *mut u8)> {
 	Ok((allocated_ptr, entry_point))
 }
 
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 fn handle_error(error: Error) {
 	#[cfg(feature = "debug")]
 	{
@@ -481,9 +461,9 @@ fn handle_error(error: Error) {
 }
 
 #[no_mangle]
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader(reserved: usize) {
-	match load() {
+	match self_load() {
 		Ok((allocated_ptr, entry_point)) => {
 			// Call entry point
 			let entry_point_callable = unsafe {
@@ -497,7 +477,7 @@ pub extern "system" fn reflective_loader(reserved: usize) {
 }
 
 #[no_mangle]
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader_wow64(reserved: usize) {
 	unsafe {
 		asm!(

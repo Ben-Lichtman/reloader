@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 pub unsafe fn syscall3(number: u32, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 	let output: u64;
 	asm!(
@@ -16,7 +16,7 @@ pub unsafe fn syscall3(number: u32, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 	output
 }
 
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 pub unsafe fn syscall5(number: u32, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
 	let output: u64;
 	asm!(
@@ -37,7 +37,7 @@ pub unsafe fn syscall5(number: u32, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
 	output
 }
 
-#[inline(never)]
+#[cfg_attr(feature = "debug", inline(never))]
 pub unsafe fn syscall6(
 	number: u32,
 	arg1: u64,

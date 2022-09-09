@@ -8,7 +8,6 @@ default = ["debug"]
 debug = []
 
 [dependencies]
-cstr_core = "0.2.5"
 ntapi = "0.3.7"
 object = { version = "0.28.3", default_features = false, features = ["read"] }
 wchar = "0.11.0"
