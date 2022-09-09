@@ -125,7 +125,7 @@ pub fn get_ip() -> usize {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn get_teb() -> &'static mut TEB {
+pub fn get_teb() -> *mut TEB {
 	let teb: *mut TEB;
 	unsafe {
 		#[cfg(target_arch = "x86_64")]
@@ -133,15 +133,13 @@ pub fn get_teb() -> &'static mut TEB {
 		#[cfg(target_arch = "x86")]
 		asm!("mov {teb}, fs:[0x18]", teb = out(reg) teb);
 	}
-	let teb = unsafe { &mut *teb };
 	teb
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn get_peb() -> &'static mut PEB {
+pub fn get_peb() -> *mut PEB {
 	let teb = get_teb();
-	let peb = unsafe { &mut *teb.ProcessEnvironmentBlock };
-	peb
+	unsafe { (*teb).ProcessEnvironmentBlock }
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
@@ -160,9 +158,10 @@ pub fn find_pe_base(start: usize) -> Result<*mut u8> {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn find_loaded_module_by_hash(ldr: &PEB_LDR_DATA, hash: u32) -> Result<*mut u8> {
+pub fn find_loaded_module_by_hash(ldr: *const PEB_LDR_DATA, hash: u32) -> Result<*mut u8> {
 	// Get initial entry in the list
-	let mut ldr_data_ptr = ldr.InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY;
+	let mut ldr_data_ptr =
+		unsafe { (*ldr).InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY };
 	while !ldr_data_ptr.is_null() {
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
@@ -187,11 +186,12 @@ pub fn find_loaded_module_by_hash(ldr: &PEB_LDR_DATA, hash: u32) -> Result<*mut 
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn find_loaded_module_by_ascii(ldr: &PEB_LDR_DATA, ascii: *const i8) -> Result<*mut u8> {
+pub fn find_loaded_module_by_ascii(ldr: *const PEB_LDR_DATA, ascii: *const i8) -> Result<*mut u8> {
 	let ascii = unsafe { CStr::from_ptr(ascii) };
 
 	// Get initial entry in the list
-	let mut ldr_data_ptr = ldr.InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY;
+	let mut ldr_data_ptr =
+		unsafe { (*ldr).InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY };
 	while !ldr_data_ptr.is_null() {
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
@@ -237,7 +237,7 @@ pub fn find_export_by_ascii(
 
 #[cfg_attr(feature = "debug", inline(never))]
 pub fn get_library_base(
-	peb_ldr: &PEB_LDR_DATA,
+	peb_ldr: *const PEB_LDR_DATA,
 	library_name: *const u8,
 	load_child_dll: &dyn Fn(*const UNICODE_STRING) -> Result<*mut u8>,
 ) -> Result<*mut u8> {
@@ -281,7 +281,7 @@ pub fn syscall_table(exports: &ExportTable, base: *mut u8) -> [u32; SYSCALL_TABL
 		.filter(|(name, _)| {
 			// Our condition is - name must start with zW
 			let name = name.to_bytes();
-			let name_0 = match name.get(0) {
+			let name_0 = match name.first() {
 				Some(&x) => x,
 				None => return false,
 			};

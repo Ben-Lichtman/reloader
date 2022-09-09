@@ -68,7 +68,7 @@ const LDRLOADDLL_HASH: u32 = fnv1a_hash_32("LdrLoadDll".as_bytes());
 #[cfg_attr(feature = "debug", inline(never))]
 fn load_dll(
 	pe_base: *mut u8,
-	peb_ldr: &PEB_LDR_DATA,
+	peb_ldr: *const PEB_LDR_DATA,
 	allocate_memory: &dyn Fn(usize) -> Result<*mut u8>,
 	protect_memory: &dyn Fn(*mut u8, usize, PAGE_PROTECTION_FLAGS) -> Result<PAGE_PROTECTION_FLAGS>,
 	flush_instruction_cache: &dyn Fn() -> Result<()>,
@@ -222,8 +222,9 @@ fn load_dll(
 				resolved_address = if unsafe { *rest.get_unchecked(0) } == b'#' {
 					// Load from ordinal
 					let number_string = unsafe { from_utf8_unchecked(rest.get_unchecked(1..)) };
-					let ordinal =
-						u16::from_str_radix(number_string, 10).map_err(|_| Error::ParseNumber)?;
+					let ordinal = number_string
+						.parse::<u16>()
+						.map_err(|_| Error::ParseNumber)?;
 
 					// Find matching function in loaded library
 					let export_rva = unsafe {
@@ -298,11 +299,11 @@ fn load_dll(
 				IMAGE_REL_BASED_ABSOLUTE => (),
 				IMAGE_REL_BASED_DIR64 => {
 					let ptr = reloc_va as *mut u64;
-					unsafe { *ptr = *ptr + calculated_offset as u64 };
+					unsafe { *ptr += calculated_offset as u64 };
 				}
 				IMAGE_REL_BASED_HIGHLOW => {
 					let ptr = reloc_va as *mut u32;
-					unsafe { *ptr = *ptr + calculated_offset as u32 };
+					unsafe { *ptr += calculated_offset as u32 };
 				}
 				_ => return Err(Error::RelocationType),
 			}
@@ -379,7 +380,7 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 
 	// Locate other important data structures
 	let peb = get_peb();
-	let peb_ldr = unsafe { &*peb.Ldr };
+	let peb_ldr = unsafe { (*peb).Ldr };
 
 	// Traverse loaded modules to find ntdll.dll
 	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
