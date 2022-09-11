@@ -3,31 +3,37 @@
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_array_assume_init)]
 #![feature(const_char_convert)]
+#![feature(maybe_uninit_uninit_array)]
 
 mod error;
 mod helpers;
+mod ntdll_wrappers;
 mod structures;
 mod syscall;
 
 use crate::{
 	error::{Error, Result},
 	helpers::{
-		find_export_by_ascii, find_export_by_hash, find_loaded_module_by_hash, find_pe_base,
-		find_syscall_by_hash, fnv1a_hash_32, fnv1a_hash_32_wstr, get_library_base, simple_memcpy,
-		syscall_table,
+		general::{
+			find_pe_base, fnv1a_hash_32, fnv1a_hash_32_wstr, get_ip, get_peb, memset_uninit_array,
+			simple_memcpy,
+		},
+		library::{
+			find_export_by_ascii, find_export_by_hash, find_loaded_module_by_hash, get_library_base,
+		},
+		syscall::{find_syscall_by_hash, gen_syscall_table, SYSCALL_TABLE_SIZE},
 	},
+	ntdll_wrappers::{allocate_memory, flush_instruction_cache, protect_memory},
 	structures::PeHeaders,
-	syscall::{syscall3, syscall5, syscall6},
 };
 use core::{
 	arch::asm,
 	ffi::CStr,
-	mem::{size_of, transmute},
+	mem::{size_of, transmute, MaybeUninit},
 	ptr::null_mut,
 	slice,
 	str::from_utf8_unchecked,
 };
-use helpers::{get_ip, get_peb};
 use ntapi::{
 	ntpsapi::PEB_LDR_DATA,
 	winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS},
@@ -43,12 +49,11 @@ use object::{
 };
 use wchar::wch;
 use windows_sys::Win32::{
-	Foundation::{STATUS_SUCCESS, UNICODE_STRING},
+	Foundation::UNICODE_STRING,
 	System::{
 		Memory::{
-			MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-			PAGE_EXECUTE_WRITECOPY, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
-			PAGE_WRITECOPY,
+			PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+			PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 		},
 		SystemServices::PIMAGE_TLS_CALLBACK,
 	},
@@ -65,14 +70,27 @@ const ZWPROTECTVIRTUALMEMORY_HASH: u32 = fnv1a_hash_32("ZwProtectVirtualMemory".
 
 const LDRLOADDLL_HASH: u32 = fnv1a_hash_32("LdrLoadDll".as_bytes());
 
+pub struct SyscallNumbers {
+	sys_no_zwallocatevirtualmemory: u32,
+	sys_no_zwprotectvirtualmemory: u32,
+	sys_no_zwflushinstructioncache: u32,
+}
+
+pub struct NtDllContext {
+	syscall_numbers: SyscallNumbers,
+	ldr_load_dll: unsafe extern "system" fn(
+		*const u16,
+		*const u32,
+		*const UNICODE_STRING,
+		*mut *mut u8,
+	) -> i32,
+}
+
 #[cfg_attr(feature = "debug", inline(never))]
 fn load_dll(
 	pe_base: *mut u8,
 	peb_ldr: *const PEB_LDR_DATA,
-	allocate_memory: &dyn Fn(usize) -> Result<*mut u8>,
-	protect_memory: &dyn Fn(*mut u8, usize, PAGE_PROTECTION_FLAGS) -> Result<PAGE_PROTECTION_FLAGS>,
-	flush_instruction_cache: &dyn Fn() -> Result<()>,
-	load_child_dll: &dyn Fn(*const UNICODE_STRING) -> Result<*mut u8>,
+	context: &NtDllContext,
 ) -> Result<(*mut u8, *mut u8)> {
 	let pe = PeHeaders::parse(pe_base)?;
 
@@ -83,7 +101,7 @@ fn load_dll(
 		.size_of_image
 		.get(LittleEndian) as usize;
 
-	let allocated_ptr = allocate_memory(size_of_image)?;
+	let allocated_ptr = allocate_memory(&context.syscall_numbers, size_of_image)?;
 
 	// Copy over header data
 	let header_size = pe
@@ -109,7 +127,7 @@ fn load_dll(
 		let library_name = unsafe { allocated_ptr.add(name_rva) };
 
 		// Load library if it is not already loaded and get the base
-		let loaded_library_base = get_library_base(peb_ldr, library_name as _, load_child_dll)?;
+		let loaded_library_base = get_library_base(peb_ldr, library_name as _, context)?;
 
 		// Find the exports of the loaded library
 		let loaded_library = PeHeaders::parse(loaded_library_base)?;
@@ -210,8 +228,7 @@ fn load_dll(
 					unsafe { working_buffer.split_at_mut_unchecked(dot_index + 5) };
 
 				// Load library if it is not already loaded and get the base
-				let loaded_library_base =
-					get_library_base(peb_ldr, dll_name.as_ptr(), load_child_dll)?;
+				let loaded_library_base = get_library_base(peb_ldr, dll_name.as_ptr(), context)?;
 
 				// Find the exports of the loaded library
 				let loaded_library = PeHeaders::parse(loaded_library_base)?;
@@ -315,7 +332,12 @@ fn load_dll(
 	}
 
 	// Set header permissions
-	protect_memory(allocated_ptr, header_size, PAGE_READONLY)?;
+	protect_memory(
+		&context.syscall_numbers,
+		allocated_ptr,
+		header_size,
+		PAGE_READONLY,
+	)?;
 
 	// Set section permissions
 	pe.section_headers.iter().try_for_each(|section| {
@@ -338,7 +360,12 @@ fn load_dll(
 			(false, true, true) => PAGE_EXECUTE_WRITECOPY,
 			(true, true, true) => PAGE_EXECUTE_READWRITE,
 		};
-		protect_memory(virtual_address, virtual_size as _, new_permissions)?;
+		protect_memory(
+			&context.syscall_numbers,
+			virtual_address,
+			virtual_size as _,
+			new_permissions,
+		)?;
 		Ok(())
 	})?;
 
@@ -352,7 +379,7 @@ fn load_dll(
 	};
 
 	// We must flush the instruction cache to avoid stale code being used which was updated by our relocation processing
-	flush_instruction_cache()?;
+	flush_instruction_cache(&context.syscall_numbers)?;
 
 	// Initialise TLS callbacks
 	let tls_callbacks = unsafe { pe.data_directories.get_unchecked(IMAGE_DIRECTORY_ENTRY_TLS) };
@@ -389,15 +416,24 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 	// Locate the export table for ntdll.dll
 	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
 
-	let syscall_table = syscall_table(&ntdll_export_table, ntdll_base);
+	// Create the syscall table
+	let mut syscall_table = MaybeUninit::uninit_array::<SYSCALL_TABLE_SIZE>();
+	let syscall_table = memset_uninit_array(&mut syscall_table, 0);
+	gen_syscall_table(&ntdll_export_table, ntdll_base, syscall_table);
 
 	// Find some important syscall numbers
 	let sys_no_zwallocatevirtualmemory =
-		find_syscall_by_hash(&syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
+		find_syscall_by_hash(syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
 	let sys_no_zwprotectvirtualmemory =
-		find_syscall_by_hash(&syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
+		find_syscall_by_hash(syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
 	let sys_no_zwflushinstructioncache =
-		find_syscall_by_hash(&syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
+		find_syscall_by_hash(syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
+
+	let syscall_numbers = SyscallNumbers {
+		sys_no_zwallocatevirtualmemory,
+		sys_no_zwprotectvirtualmemory,
+		sys_no_zwflushinstructioncache,
+	};
 
 	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
 	let ldrloaddll = unsafe {
@@ -412,79 +448,12 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 		>(ldrloaddll)
 	};
 
-	let allocate_memory = |size: usize| -> Result<*mut u8> {
-		let mut allocated_ptr = null_mut::<u8>();
-		let mut region_size = size;
-
-		let nt_status = unsafe {
-			syscall6(
-				sys_no_zwallocatevirtualmemory,
-				-1i64 as _,
-				&mut allocated_ptr as *mut _ as _,
-				0,
-				&mut region_size as *mut _ as _,
-				(MEM_RESERVE | MEM_COMMIT) as _,
-				PAGE_READWRITE as _,
-			)
-		};
-		if nt_status != STATUS_SUCCESS as _ {
-			return Err(Error::Allocation);
-		}
-
-		if allocated_ptr.is_null() {
-			return Err(Error::Allocation);
-		}
-		Ok(allocated_ptr)
+	let context = NtDllContext {
+		syscall_numbers,
+		ldr_load_dll: ldrloaddll,
 	};
 
-	let protect_memory = |base: *mut u8,
-	                      size: usize,
-	                      protection: PAGE_PROTECTION_FLAGS|
-	 -> Result<PAGE_PROTECTION_FLAGS> {
-		let base_address = base;
-		let mut region_size = size;
-		let mut old_permissions = u32::default();
-		let nt_status = unsafe {
-			syscall5(
-				sys_no_zwprotectvirtualmemory,
-				-1i64 as _,
-				&base_address as *const _ as _,
-				&mut region_size as *mut _ as _,
-				protection as _,
-				&mut old_permissions as *mut _ as _,
-			)
-		};
-		if nt_status != STATUS_SUCCESS as _ {
-			return Err(Error::Protect);
-		}
-		Ok(old_permissions)
-	};
-
-	let flush_instruction_cache = || -> Result<()> {
-		let nt_status = unsafe { syscall3(sys_no_zwflushinstructioncache, -1i64 as _, 0, 0) };
-		if nt_status != STATUS_SUCCESS as _ {
-			return Err(Error::Flush);
-		}
-		Ok(())
-	};
-
-	let load_child_dll = |unicode_string: *const UNICODE_STRING| -> Result<*mut u8> {
-		let mut module_handle = null_mut::<u8>();
-		unsafe { ldrloaddll(null_mut(), null_mut(), unicode_string, &mut module_handle) };
-		if module_handle.is_null() {
-			return Err(Error::LdrLoadDll);
-		}
-		Ok(module_handle)
-	};
-
-	load_dll(
-		pe_base,
-		peb_ldr,
-		&allocate_memory,
-		&protect_memory,
-		&flush_instruction_cache,
-		&load_child_dll,
-	)
+	load_dll(pe_base, peb_ldr, &context)
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
