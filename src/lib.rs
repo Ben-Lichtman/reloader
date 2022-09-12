@@ -29,6 +29,7 @@ use crate::{
 use core::{
 	arch::asm,
 	ffi::CStr,
+	hint::unreachable_unchecked,
 	mem::{size_of, transmute, MaybeUninit},
 	ptr::null_mut,
 	slice,
@@ -402,7 +403,7 @@ fn load_dll(
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn self_load() -> Result<(*mut u8, *mut u8)> {
+fn get_context() -> Result<(*mut u8, *mut PEB_LDR_DATA, NtDllContext)> {
 	let pe_base = find_pe_base(get_ip())?;
 
 	// Locate other important data structures
@@ -453,11 +454,11 @@ fn self_load() -> Result<(*mut u8, *mut u8)> {
 		ldr_load_dll: ldrloaddll,
 	};
 
-	load_dll(pe_base, peb_ldr, &context)
+	Ok((pe_base, peb_ldr, context))
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn handle_error(error: Error) {
+fn handle_error(error: Error) -> ! {
 	#[cfg(feature = "debug")]
 	{
 		let error_code = error as u16;
@@ -465,22 +466,29 @@ fn handle_error(error: Error) {
 		// Write error code to invalid address for rudimentary debugging
 		unsafe { *(0xdeadbeefdeadbeef as *mut _) = error_code };
 	}
+	panic!()
 }
 
 #[no_mangle]
 #[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader(reserved: usize) {
-	match self_load() {
-		Ok((allocated_ptr, entry_point)) => {
-			// Call entry point
-			let entry_point_callable = unsafe {
-				transmute::<_, unsafe extern "system" fn(usize, u32, usize)>(entry_point)
-			};
-
-			unsafe { entry_point_callable(allocated_ptr as _, DLL_PROCESS_ATTACH, reserved) };
-		}
+	// Get information needed for loading a DLL
+	let (pe_base, peb_ldr, context) = match get_context() {
+		Ok(x) => x,
 		Err(e) => handle_error(e),
-	}
+	};
+
+	// Load ourself as a DLL
+	let (allocated_ptr, entry_point) = match load_dll(pe_base, peb_ldr, &context) {
+		Ok(x) => x,
+		Err(e) => handle_error(e),
+	};
+
+	// Call entry point
+	let entry_point_callable =
+		unsafe { transmute::<_, unsafe extern "system" fn(usize, u32, usize)>(entry_point) };
+
+	unsafe { entry_point_callable(allocated_ptr as _, DLL_PROCESS_ATTACH, reserved) };
 }
 
 #[no_mangle]
