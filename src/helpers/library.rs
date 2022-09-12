@@ -1,7 +1,7 @@
 use crate::{
 	error::{Error, Result},
+	function_wrappers::load_dll,
 	helpers::general::{ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr},
-	ntdll_wrappers::load_dll,
 	structures::ExportTable,
 	NtDllContext,
 };
