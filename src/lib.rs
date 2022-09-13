@@ -6,13 +6,14 @@
 #![feature(maybe_uninit_uninit_array)]
 
 mod error;
+mod function_wrappers;
 mod helpers;
-mod ntdll_wrappers;
 mod structures;
 mod syscall;
 
 use crate::{
 	error::{Error, Result},
+	function_wrappers::{allocate_memory, flush_instruction_cache, protect_memory},
 	helpers::{
 		general::{
 			find_pe_base, fnv1a_hash_32, fnv1a_hash_32_wstr, get_ip, get_peb, memset_uninit_array,
@@ -23,13 +24,11 @@ use crate::{
 		},
 		syscall::{find_syscall_by_hash, gen_syscall_table, SYSCALL_TABLE_SIZE},
 	},
-	ntdll_wrappers::{allocate_memory, flush_instruction_cache, protect_memory},
 	structures::PeHeaders,
 };
 use core::{
 	arch::asm,
 	ffi::CStr,
-	hint::unreachable_unchecked,
 	mem::{size_of, transmute, MaybeUninit},
 	ptr::null_mut,
 	slice,
@@ -85,6 +84,82 @@ pub struct NtDllContext {
 		*const UNICODE_STRING,
 		*mut *mut u8,
 	) -> i32,
+}
+
+#[no_mangle]
+#[cfg_attr(feature = "debug", inline(never))]
+pub extern "system" fn reflective_loader(reserved: usize) {
+	match reflective_loader_impl(reserved) {
+		Ok(x) => x,
+		Err(e) => handle_error(e),
+	}
+}
+
+#[no_mangle]
+#[cfg_attr(feature = "debug", inline(never))]
+pub extern "system" fn reflective_loader_wow64(reserved: usize) {
+	unsafe {
+		asm!(
+			".code32",
+			"push ebp",
+			"mov ebp, esp",
+			"and esp, 0xfffffff0",
+			"push 0x33",
+			"call 1f",
+			"1:",
+			"add dword ptr [esp], 5",
+			"retf",
+			".code64",
+		);
+		reflective_loader(reserved);
+		asm!(
+			".code64",
+			"call 1f",
+			"1:",
+			"mov dword ptr [rsp + 4], 0x23",
+			"add dword ptr [rsp], 0xd",
+			"retf",
+			".code32",
+			"mov esp, ebp",
+			"pop ebp",
+			".code64",
+		);
+	}
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn handle_error(error: Error) -> ! {
+	#[cfg(feature = "debug")]
+	{
+		let error_code = error as u16;
+
+		// Write error code to invalid address for rudimentary debugging
+		unsafe { *(0xdeadbeefdeadbeef as *mut _) = error_code };
+	}
+	panic!()
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn reflective_loader_impl(reserved: usize) -> Result<()> {
+	// Find ourselves
+	let pe_base = find_pe_base(get_ip())?;
+
+	// Find global structures
+	let (peb_ldr, ntdll_base) = find_structures()?;
+
+	// Get information needed for loading a DLL
+	let context = get_context(ntdll_base)?;
+
+	// Load ourself as a DLL
+	let (allocated_ptr, entry_point) = load_dll(pe_base, peb_ldr, &context)?;
+
+	// Call entry point
+	let entry_point_callable =
+		unsafe { transmute::<_, unsafe extern "system" fn(usize, u32, usize)>(entry_point) };
+
+	unsafe { entry_point_callable(allocated_ptr as _, DLL_PROCESS_ATTACH, reserved) };
+
+	Ok(())
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
@@ -403,15 +478,19 @@ fn load_dll(
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn get_context() -> Result<(*mut u8, *mut PEB_LDR_DATA, NtDllContext)> {
-	let pe_base = find_pe_base(get_ip())?;
-
+fn find_structures() -> Result<(*mut PEB_LDR_DATA, *mut u8)> {
 	// Locate other important data structures
 	let peb = get_peb();
 	let peb_ldr = unsafe { (*peb).Ldr };
 
 	// Traverse loaded modules to find ntdll.dll
 	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
+
+	Ok((peb_ldr, ntdll_base))
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn get_context(ntdll_base: *mut u8) -> Result<NtDllContext> {
 	let ntdll = PeHeaders::parse(ntdll_base)?;
 
 	// Locate the export table for ntdll.dll
@@ -453,72 +532,5 @@ fn get_context() -> Result<(*mut u8, *mut PEB_LDR_DATA, NtDllContext)> {
 		syscall_numbers,
 		ldr_load_dll: ldrloaddll,
 	};
-
-	Ok((pe_base, peb_ldr, context))
-}
-
-#[cfg_attr(feature = "debug", inline(never))]
-fn handle_error(error: Error) -> ! {
-	#[cfg(feature = "debug")]
-	{
-		let error_code = error as u16;
-
-		// Write error code to invalid address for rudimentary debugging
-		unsafe { *(0xdeadbeefdeadbeef as *mut _) = error_code };
-	}
-	panic!()
-}
-
-#[no_mangle]
-#[cfg_attr(feature = "debug", inline(never))]
-pub extern "system" fn reflective_loader(reserved: usize) {
-	// Get information needed for loading a DLL
-	let (pe_base, peb_ldr, context) = match get_context() {
-		Ok(x) => x,
-		Err(e) => handle_error(e),
-	};
-
-	// Load ourself as a DLL
-	let (allocated_ptr, entry_point) = match load_dll(pe_base, peb_ldr, &context) {
-		Ok(x) => x,
-		Err(e) => handle_error(e),
-	};
-
-	// Call entry point
-	let entry_point_callable =
-		unsafe { transmute::<_, unsafe extern "system" fn(usize, u32, usize)>(entry_point) };
-
-	unsafe { entry_point_callable(allocated_ptr as _, DLL_PROCESS_ATTACH, reserved) };
-}
-
-#[no_mangle]
-#[cfg_attr(feature = "debug", inline(never))]
-pub extern "system" fn reflective_loader_wow64(reserved: usize) {
-	unsafe {
-		asm!(
-			".code32",
-			"push ebp",
-			"mov ebp, esp",
-			"and esp, 0xfffffff0",
-			"push 0x33",
-			"call 1f",
-			"1:",
-			"add dword ptr [esp], 5",
-			"retf",
-			".code64",
-		);
-		reflective_loader(reserved);
-		asm!(
-			".code64",
-			"call 1f",
-			"1:",
-			"mov dword ptr [rsp + 4], 0x23",
-			"add dword ptr [rsp], 0xd",
-			"retf",
-			".code32",
-			"mov esp, ebp",
-			"pop ebp",
-			".code64",
-		);
-	}
+	Ok(context)
 }
