@@ -76,7 +76,7 @@ pub struct SyscallNumbers {
 	sys_no_zwflushinstructioncache: u32,
 }
 
-pub struct NtDllContext {
+pub struct LoaderContext {
 	syscall_numbers: SyscallNumbers,
 	ldr_load_dll: unsafe extern "system" fn(
 		*const u16,
@@ -166,7 +166,7 @@ fn reflective_loader_impl(reserved: usize) -> Result<()> {
 fn load_dll(
 	pe_base: *mut u8,
 	peb_ldr: *const PEB_LDR_DATA,
-	context: &NtDllContext,
+	context: &LoaderContext,
 ) -> Result<(*mut u8, *mut u8)> {
 	let pe = PeHeaders::parse(pe_base)?;
 
@@ -490,7 +490,7 @@ fn find_structures() -> Result<(*mut PEB_LDR_DATA, *mut u8)> {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn get_context(ntdll_base: *mut u8) -> Result<NtDllContext> {
+fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 	let ntdll = PeHeaders::parse(ntdll_base)?;
 
 	// Locate the export table for ntdll.dll
@@ -528,7 +528,7 @@ fn get_context(ntdll_base: *mut u8) -> Result<NtDllContext> {
 		>(ldrloaddll)
 	};
 
-	let context = NtDllContext {
+	let context = LoaderContext {
 		syscall_numbers,
 		ldr_load_dll: ldrloaddll,
 	};

@@ -3,7 +3,7 @@ use crate::{
 	function_wrappers::load_dll,
 	helpers::general::{ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr},
 	structures::ExportTable,
-	NtDllContext,
+	LoaderContext,
 };
 use core::{ffi::CStr, mem::MaybeUninit, slice};
 use ntapi::{ntldr::LDR_DATA_TABLE_ENTRY, ntpsapi::PEB_LDR_DATA};
@@ -16,7 +16,7 @@ pub fn get_library_base(
 	peb_ldr: *const PEB_LDR_DATA,
 	library_name: *const u8,
 
-	context: &NtDllContext,
+	context: &LoaderContext,
 ) -> Result<*mut u8> {
 	let loaded_library_base = match find_loaded_module_by_ascii(peb_ldr, library_name as _) {
 		Ok(base) => base,
