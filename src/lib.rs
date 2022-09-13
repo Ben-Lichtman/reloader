@@ -163,6 +163,64 @@ fn reflective_loader_impl(reserved: usize) -> Result<()> {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
+fn find_structures() -> Result<(*mut PEB_LDR_DATA, *mut u8)> {
+	// Locate other important data structures
+	let peb = get_peb();
+	let peb_ldr = unsafe { (*peb).Ldr };
+
+	// Traverse loaded modules to find ntdll.dll
+	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
+
+	Ok((peb_ldr, ntdll_base))
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
+	let ntdll = PeHeaders::parse(ntdll_base)?;
+
+	// Locate the export table for ntdll.dll
+	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
+
+	// Create the syscall table
+	let mut syscall_table = MaybeUninit::uninit_array::<SYSCALL_TABLE_SIZE>();
+	let syscall_table = memset_uninit_array(&mut syscall_table, 0);
+	gen_syscall_table(&ntdll_export_table, ntdll_base, syscall_table);
+
+	// Find some important syscall numbers
+	let sys_no_zwallocatevirtualmemory =
+		find_syscall_by_hash(syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
+	let sys_no_zwprotectvirtualmemory =
+		find_syscall_by_hash(syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
+	let sys_no_zwflushinstructioncache =
+		find_syscall_by_hash(syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
+
+	let syscall_numbers = SyscallNumbers {
+		sys_no_zwallocatevirtualmemory,
+		sys_no_zwprotectvirtualmemory,
+		sys_no_zwflushinstructioncache,
+	};
+
+	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
+	let ldrloaddll = unsafe {
+		transmute::<
+			_,
+			unsafe extern "system" fn(
+				DllPath: *const u16,
+				DllCharacteristics: *const u32,
+				DllName: *const UNICODE_STRING,
+				DllHandle: *mut *mut u8,
+			) -> i32,
+		>(ldrloaddll)
+	};
+
+	let context = LoaderContext {
+		syscall_numbers,
+		ldr_load_dll: ldrloaddll,
+	};
+	Ok(context)
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
 fn load_dll(
 	pe_base: *mut u8,
 	peb_ldr: *const PEB_LDR_DATA,
@@ -475,62 +533,4 @@ fn load_dll(
 	}
 
 	Ok((allocated_ptr, entry_point))
-}
-
-#[cfg_attr(feature = "debug", inline(never))]
-fn find_structures() -> Result<(*mut PEB_LDR_DATA, *mut u8)> {
-	// Locate other important data structures
-	let peb = get_peb();
-	let peb_ldr = unsafe { (*peb).Ldr };
-
-	// Traverse loaded modules to find ntdll.dll
-	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
-
-	Ok((peb_ldr, ntdll_base))
-}
-
-#[cfg_attr(feature = "debug", inline(never))]
-fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
-	let ntdll = PeHeaders::parse(ntdll_base)?;
-
-	// Locate the export table for ntdll.dll
-	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
-
-	// Create the syscall table
-	let mut syscall_table = MaybeUninit::uninit_array::<SYSCALL_TABLE_SIZE>();
-	let syscall_table = memset_uninit_array(&mut syscall_table, 0);
-	gen_syscall_table(&ntdll_export_table, ntdll_base, syscall_table);
-
-	// Find some important syscall numbers
-	let sys_no_zwallocatevirtualmemory =
-		find_syscall_by_hash(syscall_table, ZWALLOCATEVIRTUALMEMORY_HASH)?;
-	let sys_no_zwprotectvirtualmemory =
-		find_syscall_by_hash(syscall_table, ZWPROTECTVIRTUALMEMORY_HASH)?;
-	let sys_no_zwflushinstructioncache =
-		find_syscall_by_hash(syscall_table, ZWFLUSHINSTRUCTIONCACHE_HASH)?;
-
-	let syscall_numbers = SyscallNumbers {
-		sys_no_zwallocatevirtualmemory,
-		sys_no_zwprotectvirtualmemory,
-		sys_no_zwflushinstructioncache,
-	};
-
-	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
-	let ldrloaddll = unsafe {
-		transmute::<
-			_,
-			unsafe extern "system" fn(
-				DllPath: *const u16,
-				DllCharacteristics: *const u32,
-				DllName: *const UNICODE_STRING,
-				DllHandle: *mut *mut u8,
-			) -> i32,
-		>(ldrloaddll)
-	};
-
-	let context = LoaderContext {
-		syscall_numbers,
-		ldr_load_dll: ldrloaddll,
-	};
-	Ok(context)
 }
