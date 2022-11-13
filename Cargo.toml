@@ -8,7 +8,7 @@ default = ["debug"]
 debug = []
 
 [dependencies]
-ntapi = "0.3.7"
+ntapi = { version = "0.4.0", features = ["impl-default"] }
 object = { version = "0.28.3", default_features = false, features = ["read"] }
 wchar = "0.11.0"
 

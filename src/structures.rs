@@ -2,9 +2,10 @@ use crate::error::{Error, Result};
 use core::{ffi::CStr, mem::size_of, slice};
 use object::{
 	pe::{
-		self, ImageDataDirectory, ImageDosHeader, ImageExportDirectory, ImageImportDescriptor,
-		ImageSectionHeader, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT,
-		IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
+		self, ImageDataDirectory, ImageDebugDirectory, ImageDosHeader, ImageExportDirectory,
+		ImageImportDescriptor, ImageSectionHeader, ImageTlsDirectory64,
+		IMAGE_DIRECTORY_ENTRY_DEBUG, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT,
+		IMAGE_DIRECTORY_ENTRY_TLS, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
 	},
 	read::pe::{ImageNtHeaders, ImageOptionalHeader},
 	LittleEndian,
@@ -101,6 +102,30 @@ impl PeHeaders {
 		let import_table_ptr = unsafe { image_base.add(import_table_rva as _) };
 		Ok(ImportTable::parse(import_table_ptr, import_table_size as _))
 	}
+
+	#[cfg_attr(feature = "debug", inline(never))]
+	pub fn debug_table_mem(&self, image_base: *mut u8) -> Result<DebugTable> {
+		let debug_table_data_dir = self
+			.data_directories
+			.get(IMAGE_DIRECTORY_ENTRY_DEBUG)
+			.ok_or(Error::ImportTable)?;
+		let debug_table_rva = debug_table_data_dir.virtual_address.get(LittleEndian);
+		let debug_table_size = debug_table_data_dir.size.get(LittleEndian);
+		let debug_table_ptr = unsafe { image_base.add(debug_table_rva as _) };
+		Ok(DebugTable::parse(debug_table_ptr, debug_table_size as _))
+	}
+
+	#[cfg_attr(feature = "debug", inline(never))]
+	pub fn tls_table_mem(&self, image_base: *mut u8) -> Result<Option<TlsDir>> {
+		let tls_table_data_dir = self
+			.data_directories
+			.get(IMAGE_DIRECTORY_ENTRY_TLS)
+			.ok_or(Error::ImportTable)?;
+		let tls_table_rva = tls_table_data_dir.virtual_address.get(LittleEndian);
+		let _tls_table_size = tls_table_data_dir.size.get(LittleEndian);
+		let tls_table_ptr = unsafe { image_base.add(tls_table_rva as _) };
+		Ok(TlsDir::parse(tls_table_ptr))
+	}
 }
 
 pub struct ExportTable {
@@ -190,5 +215,38 @@ impl ImportTable {
 			unsafe { slice::from_raw_parts_mut(import_descriptor_ptr, number_of_entries) };
 
 		Self { import_descriptors }
+	}
+}
+
+pub struct DebugTable {
+	pub debug_descriptors: &'static mut [ImageDebugDirectory],
+}
+
+impl DebugTable {
+	#[cfg_attr(feature = "debug", inline(never))]
+	pub fn parse(address: *mut u8, size: usize) -> Self {
+		let number_of_entries = size / size_of::<ImageDebugDirectory>() - 1;
+		let debug_descriptor_ptr = address.cast::<ImageDebugDirectory>();
+		let debug_descriptors =
+			unsafe { slice::from_raw_parts_mut(debug_descriptor_ptr, number_of_entries) };
+
+		Self { debug_descriptors }
+	}
+}
+
+pub struct TlsDir {
+	pub tls_dir: &'static mut ImageTlsDirectory64,
+}
+
+impl TlsDir {
+	#[cfg_attr(feature = "debug", inline(never))]
+	pub fn parse(address: *mut u8) -> Option<Self> {
+		if address.is_null() {
+			return None;
+		}
+
+		let tls_dir = unsafe { &mut *address.cast::<ImageTlsDirectory64>() };
+
+		Some(Self { tls_dir })
 	}
 }

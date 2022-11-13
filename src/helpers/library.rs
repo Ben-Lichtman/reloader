@@ -1,11 +1,13 @@
 use crate::{
 	error::{Error, Result},
 	function_wrappers::load_dll,
-	helpers::general::{ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr},
+	helpers::general::{
+		ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr, LinkedListPointer,
+	},
 	structures::ExportTable,
 	LoaderContext,
 };
-use core::{ffi::CStr, mem::MaybeUninit, slice};
+use core::{ffi::CStr, mem::MaybeUninit, ptr::addr_of_mut, slice};
 use ntapi::{ntldr::LDR_DATA_TABLE_ENTRY, ntpsapi::PEB_LDR_DATA};
 use windows_sys::Win32::Foundation::UNICODE_STRING;
 
@@ -13,7 +15,7 @@ const LIBRARY_CONVERSION_BUFFER_SIZE: usize = 64;
 
 #[cfg_attr(feature = "debug", inline(never))]
 pub fn get_library_base(
-	peb_ldr: *const PEB_LDR_DATA,
+	peb_ldr: *mut PEB_LDR_DATA,
 	library_name: *const u8,
 
 	context: &LoaderContext,
@@ -48,11 +50,16 @@ pub fn get_library_base(
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn find_loaded_module_by_hash(ldr: *const PEB_LDR_DATA, hash: u32) -> Result<*mut u8> {
-	// Get initial entry in the list
-	let mut ldr_data_ptr =
-		unsafe { (*ldr).InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY };
-	while !ldr_data_ptr.is_null() {
+pub fn find_loaded_module_by_hash(ldr: *mut PEB_LDR_DATA, hash: u32) -> Result<*mut u8> {
+	// Get list head
+	let head = unsafe { addr_of_mut!((*ldr).InLoadOrderModuleList) };
+	// Get initial entry
+	let first = unsafe { (*head).Flink };
+
+	let mut iter = LinkedListPointer::new(first);
+
+	while let Some(entry) = iter.next_until(head) {
+		let ldr_data_ptr = entry as *mut LDR_DATA_TABLE_ENTRY;
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
 		// Make a slice of wchars from the base name
@@ -63,26 +70,28 @@ pub fn find_loaded_module_by_hash(ldr: *const PEB_LDR_DATA, hash: u32) -> Result
 		}
 		let dll_name_wstr = unsafe { slice::from_raw_parts(buffer, dll_name.Length as usize / 2) };
 
-		if fnv1a_hash_32_wstr(dll_name_wstr) != hash {
-			// Go to the next entry
-			ldr_data_ptr = ldr_data.InLoadOrderLinks.Flink as *mut LDR_DATA_TABLE_ENTRY;
-			continue;
+		if fnv1a_hash_32_wstr(dll_name_wstr) == hash {
+			// Return the base address for this DLL
+			return Ok(ldr_data.DllBase as _);
 		}
-
-		// Return the base address for this DLL
-		return Ok(ldr_data.DllBase as _);
 	}
 	Err(Error::ModuleByHash)
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-pub fn find_loaded_module_by_ascii(ldr: *const PEB_LDR_DATA, ascii: *const i8) -> Result<*mut u8> {
+pub fn find_loaded_module_by_ascii(ldr: *mut PEB_LDR_DATA, ascii: *const i8) -> Result<*mut u8> {
 	let ascii = unsafe { CStr::from_ptr(ascii) };
 
-	// Get initial entry in the list
-	let mut ldr_data_ptr =
-		unsafe { (*ldr).InLoadOrderModuleList.Flink as *mut LDR_DATA_TABLE_ENTRY };
-	while !ldr_data_ptr.is_null() {
+	// Get list head
+	let head = unsafe { addr_of_mut!((*ldr).InLoadOrderModuleList) };
+	// Get initial entry
+	let first = unsafe { (*head).Flink };
+
+	let mut iter = LinkedListPointer::new(first);
+
+	while let Some(entry) = iter.next_until(head) {
+		let ldr_data_ptr = entry as *mut LDR_DATA_TABLE_ENTRY;
+
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
 		// Make a slice of wchars from the base name
@@ -94,11 +103,9 @@ pub fn find_loaded_module_by_ascii(ldr: *const PEB_LDR_DATA, ascii: *const i8) -
 		let dll_name_wstr = unsafe { slice::from_raw_parts(buffer, dll_name.Length as usize / 2) };
 
 		if ascii_wstr_eq(ascii, dll_name_wstr) {
+			// Return the base address for this DLL
 			return Ok(ldr_data.DllBase as _);
 		}
-
-		// Go to the next entry
-		ldr_data_ptr = ldr_data.InLoadOrderLinks.Flink as *mut LDR_DATA_TABLE_ENTRY;
 	}
 	Err(Error::ModuleByAscii)
 }

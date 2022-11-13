@@ -16,7 +16,7 @@ use crate::{
 	function_wrappers::{allocate_memory, flush_instruction_cache, protect_memory},
 	helpers::{
 		general::{
-			find_pe_base, fnv1a_hash_32, fnv1a_hash_32_wstr, get_ip, get_peb, memset_uninit_array,
+			find_pe_base, fnv1a_hash_32, fnv1a_hash_32_wstr, get_ip, get_teb, memset_uninit_array,
 			simple_memcpy,
 		},
 		library::{
@@ -30,11 +30,12 @@ use core::{
 	arch::asm,
 	ffi::CStr,
 	mem::{size_of, transmute, MaybeUninit},
-	ptr::null_mut,
+	ptr::{addr_of_mut, null_mut},
 	slice,
 	str::from_utf8_unchecked,
 };
 use ntapi::{
+	ntpebteb::TEB,
 	ntpsapi::PEB_LDR_DATA,
 	winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS},
 };
@@ -70,10 +71,18 @@ const ZWPROTECTVIRTUALMEMORY_HASH: u32 = fnv1a_hash_32("ZwProtectVirtualMemory".
 
 const LDRLOADDLL_HASH: u32 = fnv1a_hash_32("LdrLoadDll".as_bytes());
 
+const GET_TICK_COUNT: u32 = fnv1a_hash_32("NtGetTickCount".as_bytes());
+
 pub struct SyscallNumbers {
 	sys_no_zwallocatevirtualmemory: u32,
 	sys_no_zwprotectvirtualmemory: u32,
 	sys_no_zwflushinstructioncache: u32,
+}
+
+pub struct ImportantStructures {
+	teb: *mut TEB,
+	peb_ldr: *mut PEB_LDR_DATA,
+	ntdll_base: *mut u8,
 }
 
 pub struct LoaderContext {
@@ -84,12 +93,13 @@ pub struct LoaderContext {
 		*const UNICODE_STRING,
 		*mut *mut u8,
 	) -> i32,
+	get_tick_count: unsafe extern "system" fn() -> u32,
 }
 
 #[no_mangle]
 #[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader(reserved: usize) {
-	match reflective_loader_impl(reserved) {
+	match reflective_loader_impl(reserved, false) {
 		Ok(x) => x,
 		Err(e) => handle_error(e),
 	}
@@ -111,7 +121,10 @@ pub extern "system" fn reflective_loader_wow64(reserved: usize) {
 			"retf",
 			".code64",
 		);
-		reflective_loader(reserved);
+		match reflective_loader_impl(reserved, true) {
+			Ok(x) => x,
+			Err(e) => handle_error(e),
+		}
 		asm!(
 			".code64",
 			"call 1f",
@@ -140,18 +153,22 @@ fn handle_error(error: Error) -> ! {
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
-fn reflective_loader_impl(reserved: usize) -> Result<()> {
+fn reflective_loader_impl(reserved: usize, wow64: bool) -> Result<()> {
 	// Find ourselves
 	let pe_base = find_pe_base(get_ip())?;
 
 	// Find global structures
-	let (peb_ldr, ntdll_base) = find_structures()?;
+	let important_structures = find_structures()?;
 
 	// Get information needed for loading a DLL
-	let context = get_context(ntdll_base)?;
+	let context = get_context(important_structures.ntdll_base)?;
+
+	if wow64 {
+		fixup_wow64(&important_structures, &context);
+	}
 
 	// Load ourself as a DLL
-	let (allocated_ptr, entry_point) = load_dll(pe_base, peb_ldr, &context)?;
+	let (allocated_ptr, entry_point) = load_dll(pe_base, important_structures.peb_ldr, &context)?;
 
 	// Call entry point
 	let entry_point_callable =
@@ -162,16 +179,40 @@ fn reflective_loader_impl(reserved: usize) -> Result<()> {
 	Ok(())
 }
 
+fn fixup_wow64(important_structures: &ImportantStructures, context: &LoaderContext) {
+	// The process state in 64 bit mode is totally broken, we need to get it to some barely-functional state - enough to load some dependency DLLs etc.
+	// Some dependencies will conflict with the 32 bit environment, but we will just assume that everything is fine here.
+	// Ideally we'd be reimplementing some actual NTDLL functionality rather than these easy hacks
+
+	// Initialize thread activation context
+	let tick_count = unsafe { (context.get_tick_count)() };
+	let teb = unsafe { &mut (*important_structures.teb) };
+	let context_stack = &mut teb.ActivationStack;
+	context_stack.StackId = tick_count;
+	context_stack.NextCookieSequenceNumber = 1;
+	context_stack.Flags = 2;
+	context_stack.ActiveFrame = null_mut();
+	teb.ActivationContextStackPointer = context_stack;
+
+	// Initialize TLS
+	teb.ThreadLocalStoragePointer = addr_of_mut!(teb.ThreadLocalStoragePointer) as _;
+}
+
 #[cfg_attr(feature = "debug", inline(never))]
-fn find_structures() -> Result<(*mut PEB_LDR_DATA, *mut u8)> {
+fn find_structures() -> Result<ImportantStructures> {
 	// Locate other important data structures
-	let peb = get_peb();
+	let teb = get_teb();
+	let peb = unsafe { (*teb).ProcessEnvironmentBlock };
 	let peb_ldr = unsafe { (*peb).Ldr };
 
 	// Traverse loaded modules to find ntdll.dll
 	let ntdll_base = find_loaded_module_by_hash(peb_ldr, NTDLL_HASH)?;
 
-	Ok((peb_ldr, ntdll_base))
+	Ok(ImportantStructures {
+		teb,
+		peb_ldr,
+		ntdll_base,
+	})
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
@@ -213,9 +254,12 @@ fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 		>(ldrloaddll)
 	};
 
+	let get_tick_count = find_export_by_hash(&ntdll_export_table, ntdll_base, GET_TICK_COUNT)?;
+
 	let context = LoaderContext {
 		syscall_numbers,
 		ldr_load_dll: ldrloaddll,
+		get_tick_count: unsafe { transmute(get_tick_count) },
 	};
 	Ok(context)
 }
@@ -223,7 +267,7 @@ fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 #[cfg_attr(feature = "debug", inline(never))]
 fn load_dll(
 	pe_base: *mut u8,
-	peb_ldr: *const PEB_LDR_DATA,
+	peb_ldr: *mut PEB_LDR_DATA,
 	context: &LoaderContext,
 ) -> Result<(*mut u8, *mut u8)> {
 	let pe = PeHeaders::parse(pe_base)?;
@@ -353,6 +397,7 @@ fn load_dll(
 				// Write DLL
 				unsafe {
 					*working_buffer.get_unchecked_mut(dot_index + 1) = b'd';
+
 					*working_buffer.get_unchecked_mut(dot_index + 2) = b'l';
 					*working_buffer.get_unchecked_mut(dot_index + 3) = b'l';
 					*working_buffer.get_unchecked_mut(dot_index + 4) = b'\0';

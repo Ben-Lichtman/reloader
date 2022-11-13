@@ -6,9 +6,58 @@ use core::{
 	arch::asm,
 	ffi::CStr,
 	mem::{transmute, MaybeUninit},
+	ptr::null_mut,
 	sync::atomic::{compiler_fence, Ordering},
 };
-use ntapi::ntpebteb::{PEB, TEB};
+use ntapi::{ntpebteb::TEB, winapi::shared::ntdef::LIST_ENTRY};
+
+pub struct LinkedListPointer(*mut LIST_ENTRY);
+
+impl LinkedListPointer {
+	pub fn new(start: *mut LIST_ENTRY) -> Self { Self(start) }
+
+	pub fn next(&mut self) -> *mut LIST_ENTRY {
+		let cur = self.0;
+		self.0 = unsafe { (*self.0).Flink };
+		cur
+	}
+
+	pub fn prev(&mut self) -> *mut LIST_ENTRY {
+		let cur = self.0;
+		self.0 = unsafe { (*self.0).Blink };
+		cur
+	}
+
+	pub fn next_until(&mut self, finish: *mut LIST_ENTRY) -> Option<*mut LIST_ENTRY> {
+		if self.0.is_null() {
+			return None;
+		}
+		let cur = self.0;
+		let next = unsafe { (*self.0).Flink };
+		if next == finish {
+			self.0 = null_mut();
+		}
+		else {
+			self.0 = next;
+		}
+		Some(cur)
+	}
+
+	pub fn prev_until(&mut self, finish: *mut LIST_ENTRY) -> Option<*mut LIST_ENTRY> {
+		if self.0.is_null() {
+			return None;
+		}
+		let cur = self.0;
+		let prev = unsafe { (*self.0).Blink };
+		if prev == finish {
+			self.0 = null_mut();
+		}
+		else {
+			self.0 = prev;
+		}
+		Some(cur)
+	}
+}
 
 #[cfg_attr(feature = "debug", inline(never))]
 pub const fn fnv1a_hash_32(chars: &[u8]) -> u32 {
@@ -129,12 +178,6 @@ pub fn get_teb() -> *mut TEB {
 		asm!("mov {teb}, fs:[0x18]", teb = out(reg) teb);
 	}
 	teb
-}
-
-#[cfg_attr(feature = "debug", inline(never))]
-pub fn get_peb() -> *mut PEB {
-	let teb = get_teb();
-	unsafe { (*teb).ProcessEnvironmentBlock }
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
