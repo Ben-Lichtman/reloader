@@ -1,9 +1,8 @@
 #![no_std]
 #![feature(slice_split_at_unchecked)]
 #![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_array_assume_init)]
-#![feature(const_char_convert)]
 #![feature(maybe_uninit_uninit_array)]
+#![feature(const_char_from_u32_unchecked)]
 
 mod error;
 mod function_wrappers;
@@ -164,11 +163,21 @@ fn reflective_loader_impl(reserved: usize, wow64: bool) -> Result<()> {
 	let context = get_context(important_structures.ntdll_base)?;
 
 	if wow64 {
-		fixup_wow64(&important_structures, &context);
+		fixup_wow64_pre(&important_structures, &context);
 	}
 
 	// Load ourself as a DLL
-	let (allocated_ptr, entry_point) = load_dll(pe_base, important_structures.peb_ldr, &context)?;
+	let (allocated_ptr, size_of_image, entry_point) =
+		load_dll(pe_base, important_structures.peb_ldr, &context)?;
+
+	if wow64 {
+		fixup_wow64_post(
+			&important_structures,
+			&context,
+			allocated_ptr,
+			size_of_image,
+		);
+	}
 
 	// Call entry point
 	let entry_point_callable =
@@ -179,7 +188,8 @@ fn reflective_loader_impl(reserved: usize, wow64: bool) -> Result<()> {
 	Ok(())
 }
 
-fn fixup_wow64(important_structures: &ImportantStructures, context: &LoaderContext) {
+#[cfg_attr(feature = "debug", inline(never))]
+fn fixup_wow64_pre(important_structures: &ImportantStructures, context: &LoaderContext) {
 	// The process state in 64 bit mode is totally broken, we need to get it to some barely-functional state - enough to load some dependency DLLs etc.
 	// Some dependencies will conflict with the 32 bit environment, but we will just assume that everything is fine here.
 	// Ideally we'd be reimplementing some actual NTDLL functionality rather than these easy hacks
@@ -196,6 +206,16 @@ fn fixup_wow64(important_structures: &ImportantStructures, context: &LoaderConte
 
 	// Initialize TLS
 	teb.ThreadLocalStoragePointer = addr_of_mut!(teb.ThreadLocalStoragePointer) as _;
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn fixup_wow64_post(
+	important_structures: &ImportantStructures,
+	context: &LoaderContext,
+	pe_base: *mut u8,
+	allocated_size: usize,
+) {
+	// TODO
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
@@ -269,7 +289,7 @@ fn load_dll(
 	pe_base: *mut u8,
 	peb_ldr: *mut PEB_LDR_DATA,
 	context: &LoaderContext,
-) -> Result<(*mut u8, *mut u8)> {
+) -> Result<(*mut u8, usize, *mut u8)> {
 	let pe = PeHeaders::parse(pe_base)?;
 
 	// Allocate space to map the PE into
@@ -281,28 +301,69 @@ fn load_dll(
 
 	let allocated_ptr = allocate_memory(&context.syscall_numbers, size_of_image)?;
 
+	let header_size = copy_header(allocated_ptr, &pe, pe_base);
+
+	map_sections(allocated_ptr, &pe, pe_base);
+
+	process_imports(allocated_ptr, &pe, peb_ldr, context)?;
+
+	process_relocations(allocated_ptr, &pe)?;
+
+	set_permissions(allocated_ptr, header_size, &pe, context)?;
+
+	let entry_point = unsafe {
+		allocated_ptr.add(
+			pe.nt_header
+				.optional_header()
+				.address_of_entry_point
+				.get(LittleEndian) as _,
+		)
+	};
+
+	// We must flush the instruction cache to avoid stale code being used which was updated by our relocation processing
+	flush_instruction_cache(&context.syscall_numbers)?;
+
+	process_tls(allocated_ptr, &pe);
+
+	Ok((allocated_ptr, size_of_image, entry_point))
+}
+
+#[cfg_attr(feature = "debug", inline(never))]
+fn copy_header(dest: *mut u8, pe: &PeHeaders, pe_base: *mut u8) -> usize {
 	// Copy over header data
 	let header_size = pe
 		.nt_header
 		.optional_header()
 		.size_of_headers
 		.get(LittleEndian) as _;
-	simple_memcpy(allocated_ptr, pe_base, header_size);
+	simple_memcpy(dest, pe_base, header_size);
+	header_size
+}
 
+#[cfg_attr(feature = "debug", inline(never))]
+fn map_sections(dest: *mut u8, pe: &PeHeaders, pe_base: *mut u8) {
 	// Map sections
 	pe.section_headers.iter().for_each(|section| {
-		let dest = unsafe { allocated_ptr.add(section.virtual_address.get(LittleEndian) as _) };
+		let dest = unsafe { dest.add(section.virtual_address.get(LittleEndian) as _) };
 		let src = unsafe { pe_base.add(section.pointer_to_raw_data.get(LittleEndian) as _) };
 		let size = section.size_of_raw_data.get(LittleEndian) as _;
 		simple_memcpy(dest, src, size);
 	});
+}
 
+#[cfg_attr(feature = "debug", inline(never))]
+fn process_imports(
+	dest: *mut u8,
+	pe: &PeHeaders,
+	peb_ldr: *mut PEB_LDR_DATA,
+	context: &LoaderContext,
+) -> Result<()> {
 	// Process import table
-	let import_table = pe.import_table_mem(allocated_ptr)?;
+	let import_table = pe.import_table_mem(dest)?;
 	for idt in import_table.import_descriptors {
 		// Load the library
 		let name_rva = idt.name.get(LittleEndian) as usize;
-		let library_name = unsafe { allocated_ptr.add(name_rva) };
+		let library_name = unsafe { dest.add(name_rva) };
 
 		// Load library if it is not already loaded and get the base
 		let loaded_library_base = get_library_base(peb_ldr, library_name as _, context)?;
@@ -314,8 +375,8 @@ fn load_dll(
 		let ilt_rva = idt.original_first_thunk.get(LittleEndian) as usize;
 		let iat_rva = idt.first_thunk.get(LittleEndian) as usize;
 
-		let mut ilt_ptr = unsafe { allocated_ptr.add(ilt_rva).cast::<ImageThunkData64>() };
-		let mut iat_ptr = unsafe { allocated_ptr.add(iat_rva).cast::<usize>() };
+		let mut ilt_ptr = unsafe { dest.add(ilt_rva).cast::<ImageThunkData64>() };
+		let mut iat_ptr = unsafe { dest.add(iat_rva).cast::<usize>() };
 
 		// Look through each entry in the ILT until we find a null entry
 		while unsafe { ilt_ptr.read().raw() != 0 } {
@@ -343,7 +404,7 @@ fn load_dll(
 					let address_rva = ilt_entry.address() as _;
 
 					// Get the name of the function
-					let string_va = unsafe { allocated_ptr.add(address_rva).add(size_of::<u16>()) };
+					let string_va = unsafe { dest.add(address_rva).add(size_of::<u16>()) };
 					let string = unsafe { CStr::from_ptr(string_va as _) };
 
 					// Find matching function in loaded library
@@ -455,10 +516,14 @@ fn load_dll(
 			iat_ptr = unsafe { iat_ptr.add(1) };
 		}
 	}
+	Ok(())
+}
 
+#[cfg_attr(feature = "debug", inline(never))]
+fn process_relocations(dest: *mut u8, pe: &PeHeaders) -> Result<()> {
 	// Process relocations
 	let image_base_in_file = pe.nt_header.optional_header().image_base();
-	let calculated_offset = allocated_ptr as isize - image_base_in_file as isize;
+	let calculated_offset = dest as isize - image_base_in_file as isize;
 
 	let relocations = unsafe {
 		pe.data_directories
@@ -467,7 +532,7 @@ fn load_dll(
 
 	// Iterate through the relocation table
 	let reloc_start_address =
-		unsafe { allocated_ptr.add(relocations.virtual_address.get(LittleEndian) as _) };
+		unsafe { dest.add(relocations.virtual_address.get(LittleEndian) as _) };
 	let reloc_size_bytes = relocations.size.get(LittleEndian) as _;
 
 	let mut reloc_byte_slice =
@@ -478,7 +543,7 @@ fn load_dll(
 		let rva = u32::from_le_bytes([a, b, c, d]) as usize;
 		let relocs_bytes = u32::from_le_bytes([e, f, g, h]) as usize - 8;
 
-		let block_va = unsafe { allocated_ptr.add(rva) };
+		let block_va = unsafe { dest.add(rva) };
 
 		// Loop over the relocations in this block
 		let (mut relocs_slice, rest) = unsafe { rest.split_at_unchecked(relocs_bytes) };
@@ -509,19 +574,22 @@ fn load_dll(
 
 		reloc_byte_slice = rest;
 	}
+	Ok(())
+}
 
+#[cfg_attr(feature = "debug", inline(never))]
+fn set_permissions(
+	dest: *mut u8,
+	header_size: usize,
+	pe: &PeHeaders,
+	context: &LoaderContext,
+) -> Result<()> {
 	// Set header permissions
-	protect_memory(
-		&context.syscall_numbers,
-		allocated_ptr,
-		header_size,
-		PAGE_READONLY,
-	)?;
+	protect_memory(&context.syscall_numbers, dest, header_size, PAGE_READONLY)?;
 
 	// Set section permissions
 	pe.section_headers.iter().try_for_each(|section| {
-		let virtual_address =
-			unsafe { allocated_ptr.add(section.virtual_address.get(LittleEndian) as _) };
+		let virtual_address = unsafe { dest.add(section.virtual_address.get(LittleEndian) as _) };
 		let virtual_size = section.virtual_size.get(LittleEndian);
 
 		// Change permissions
@@ -547,23 +615,14 @@ fn load_dll(
 		)?;
 		Ok(())
 	})?;
+	Ok(())
+}
 
-	let entry_point = unsafe {
-		allocated_ptr.add(
-			pe.nt_header
-				.optional_header()
-				.address_of_entry_point
-				.get(LittleEndian) as _,
-		)
-	};
-
-	// We must flush the instruction cache to avoid stale code being used which was updated by our relocation processing
-	flush_instruction_cache(&context.syscall_numbers)?;
-
+#[cfg_attr(feature = "debug", inline(never))]
+fn process_tls(dest: *mut u8, pe: &PeHeaders) {
 	// Initialise TLS callbacks
 	let tls_callbacks = unsafe { pe.data_directories.get_unchecked(IMAGE_DIRECTORY_ENTRY_TLS) };
-	let tls_dir =
-		unsafe { allocated_ptr.add(tls_callbacks.virtual_address.get(LittleEndian) as _) };
+	let tls_dir = unsafe { dest.add(tls_callbacks.virtual_address.get(LittleEndian) as _) };
 	#[cfg(target_arch = "x86_64")]
 	let tls_dir = unsafe { &*tls_dir.cast::<pe::ImageTlsDirectory64>() };
 	#[cfg(target_arch = "x86")]
@@ -573,9 +632,7 @@ fn load_dll(
 	let mut callback_addr =
 		tls_dir.address_of_call_backs.get(LittleEndian) as *const PIMAGE_TLS_CALLBACK;
 	while let Some(callback) = unsafe { *callback_addr } {
-		unsafe { callback(allocated_ptr as _, DLL_PROCESS_ATTACH, null_mut()) };
+		unsafe { callback(dest as _, DLL_PROCESS_ATTACH, null_mut()) };
 		callback_addr = unsafe { callback_addr.add(1) };
 	}
-
-	Ok((allocated_ptr, entry_point))
 }
