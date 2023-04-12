@@ -412,7 +412,7 @@ fn process_imports(
 			// Forwarding
 			let mut current_export_start = loaded_library_exports.start_address;
 			let mut current_export_end =
-				unsafe { current_export_start.add(loaded_library_exports.size as _) };
+				unsafe { current_export_start.add(loaded_library_exports.size as _) as _ };
 			let function_va = loop {
 				let mut buffer = [0u8; 64];
 
@@ -502,7 +502,7 @@ fn process_imports(
 				// Set the new export range
 				current_export_start = loaded_library_exports.start_address;
 				current_export_end =
-					unsafe { current_export_start.add(loaded_library_exports.size as _) };
+					unsafe { current_export_start.add(loaded_library_exports.size as _) as _ };
 			};
 
 			// Write function VA into IAT
