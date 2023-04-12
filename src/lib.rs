@@ -7,7 +7,6 @@
 mod error;
 mod function_wrappers;
 mod helpers;
-mod structures;
 mod syscall;
 
 use crate::{
@@ -23,7 +22,6 @@ use crate::{
 		},
 		syscall::{find_syscall_by_hash, gen_syscall_table, SYSCALL_TABLE_SIZE},
 	},
-	structures::PeHeaders,
 };
 use core::{
 	arch::asm,
@@ -40,22 +38,20 @@ use ntapi::{
 };
 use object::{
 	pe::{
-		self, ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_TLS,
-		IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
-		IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+		ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_REL_BASED_ABSOLUTE,
+		IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+		IMAGE_SCN_MEM_WRITE,
 	},
 	read::pe::{ImageNtHeaders, ImageOptionalHeader, ImageThunkData},
 	LittleEndian,
 };
+use objparse::PeHeaders;
 use wchar::wch;
 use windows_sys::Win32::{
 	Foundation::UNICODE_STRING,
-	System::{
-		Memory::{
-			PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
-			PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
-		},
-		SystemServices::PIMAGE_TLS_CALLBACK,
+	System::Memory::{
+		PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+		PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 	},
 };
 
@@ -237,10 +233,10 @@ fn find_structures() -> Result<ImportantStructures> {
 
 #[cfg_attr(feature = "debug", inline(never))]
 fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
-	let ntdll = PeHeaders::parse(ntdll_base)?;
+	let ntdll = unsafe { PeHeaders::parse(ntdll_base) }?;
 
 	// Locate the export table for ntdll.dll
-	let ntdll_export_table = ntdll.export_table_mem(ntdll_base)?;
+	let ntdll_export_table = unsafe { ntdll.export_table_mem(ntdll_base) }?;
 
 	// Create the syscall table
 	let mut syscall_table = MaybeUninit::uninit_array::<SYSCALL_TABLE_SIZE>();
@@ -290,7 +286,7 @@ fn load_dll(
 	peb_ldr: *mut PEB_LDR_DATA,
 	context: &LoaderContext,
 ) -> Result<(*mut u8, usize, *mut u8)> {
-	let pe = PeHeaders::parse(pe_base)?;
+	let pe = unsafe { PeHeaders::parse(pe_base) }?;
 
 	// Allocate space to map the PE into
 	let size_of_image = pe
@@ -359,7 +355,7 @@ fn process_imports(
 	context: &LoaderContext,
 ) -> Result<()> {
 	// Process import table
-	let import_table = pe.import_table_mem(dest)?;
+	let import_table = unsafe { pe.import_table_mem(dest) }?;
 	for idt in import_table.import_descriptors {
 		// Load the library
 		let name_rva = idt.name.get(LittleEndian) as usize;
@@ -369,8 +365,9 @@ fn process_imports(
 		let loaded_library_base = get_library_base(peb_ldr, library_name as _, context)?;
 
 		// Find the exports of the loaded library
-		let loaded_library = PeHeaders::parse(loaded_library_base)?;
-		let loaded_library_exports = loaded_library.export_table_mem(loaded_library_base)?;
+		let loaded_library = unsafe { PeHeaders::parse(loaded_library_base) }?;
+		let loaded_library_exports =
+			unsafe { loaded_library.export_table_mem(loaded_library_base) }?;
 
 		let ilt_rva = idt.original_first_thunk.get(LittleEndian) as usize;
 		let iat_rva = idt.first_thunk.get(LittleEndian) as usize;
@@ -471,9 +468,9 @@ fn process_imports(
 				let loaded_library_base = get_library_base(peb_ldr, dll_name.as_ptr(), context)?;
 
 				// Find the exports of the loaded library
-				let loaded_library = PeHeaders::parse(loaded_library_base)?;
+				let loaded_library = unsafe { PeHeaders::parse(loaded_library_base) }?;
 				let loaded_library_exports =
-					loaded_library.export_table_mem(loaded_library_base)?;
+					unsafe { loaded_library.export_table_mem(loaded_library_base) }?;
 
 				// Set resolved address for next loop
 				resolved_address = if unsafe { *rest.get_unchecked(0) } == b'#' {
@@ -588,51 +585,45 @@ fn set_permissions(
 	protect_memory(&context.syscall_numbers, dest, header_size, PAGE_READONLY)?;
 
 	// Set section permissions
-	pe.section_headers.iter().try_for_each(|section| {
-		let virtual_address = unsafe { dest.add(section.virtual_address.get(LittleEndian) as _) };
-		let virtual_size = section.virtual_size.get(LittleEndian);
+	pe.section_headers
+		.iter()
+		.try_for_each(|section| -> core::result::Result<(), Error> {
+			let virtual_address =
+				unsafe { dest.add(section.virtual_address.get(LittleEndian) as _) };
+			let virtual_size = section.virtual_size.get(LittleEndian);
 
-		// Change permissions
-		let characteristics = section.characteristics.get(LittleEndian);
-		let r = characteristics & IMAGE_SCN_MEM_READ != 0;
-		let w = characteristics & IMAGE_SCN_MEM_WRITE != 0;
-		let x = characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
-		let new_permissions = match (r, w, x) {
-			(false, false, false) => PAGE_NOACCESS,
-			(true, false, false) => PAGE_READONLY,
-			(false, true, false) => PAGE_WRITECOPY,
-			(true, true, false) => PAGE_READWRITE,
-			(false, false, true) => PAGE_EXECUTE,
-			(true, false, true) => PAGE_EXECUTE_READ,
-			(false, true, true) => PAGE_EXECUTE_WRITECOPY,
-			(true, true, true) => PAGE_EXECUTE_READWRITE,
-		};
-		protect_memory(
-			&context.syscall_numbers,
-			virtual_address,
-			virtual_size as _,
-			new_permissions,
-		)?;
-		Ok(())
-	})?;
+			// Change permissions
+			let characteristics = section.characteristics.get(LittleEndian);
+			let r = characteristics & IMAGE_SCN_MEM_READ != 0;
+			let w = characteristics & IMAGE_SCN_MEM_WRITE != 0;
+			let x = characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
+			let new_permissions = match (r, w, x) {
+				(false, false, false) => PAGE_NOACCESS,
+				(true, false, false) => PAGE_READONLY,
+				(false, true, false) => PAGE_WRITECOPY,
+				(true, true, false) => PAGE_READWRITE,
+				(false, false, true) => PAGE_EXECUTE,
+				(true, false, true) => PAGE_EXECUTE_READ,
+				(false, true, true) => PAGE_EXECUTE_WRITECOPY,
+				(true, true, true) => PAGE_EXECUTE_READWRITE,
+			};
+			protect_memory(
+				&context.syscall_numbers,
+				virtual_address,
+				virtual_size as _,
+				new_permissions,
+			)?;
+			Ok(())
+		})?;
 	Ok(())
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
 fn process_tls(dest: *mut u8, pe: &PeHeaders) {
-	// Initialise TLS callbacks
-	let tls_callbacks = unsafe { pe.data_directories.get_unchecked(IMAGE_DIRECTORY_ENTRY_TLS) };
-	let tls_dir = unsafe { dest.add(tls_callbacks.virtual_address.get(LittleEndian) as _) };
-	#[cfg(target_arch = "x86_64")]
-	let tls_dir = unsafe { &*tls_dir.cast::<pe::ImageTlsDirectory64>() };
-	#[cfg(target_arch = "x86")]
-	let tls_dir = unsafe { &*tls_dir.cast::<pe::ImageTlsDirectory32>() };
+	let tls_callbacks = unsafe { pe.tls_table_mem(dest).unwrap().unwrap() };
 
 	// Calling each TLS callback
-	let mut callback_addr =
-		tls_dir.address_of_call_backs.get(LittleEndian) as *const PIMAGE_TLS_CALLBACK;
-	while let Some(callback) = unsafe { *callback_addr } {
+	for callback in tls_callbacks.callbacks() {
 		unsafe { callback(dest as _, DLL_PROCESS_ATTACH, null_mut()) };
-		callback_addr = unsafe { callback_addr.add(1) };
 	}
 }

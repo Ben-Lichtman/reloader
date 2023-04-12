@@ -1,7 +1,8 @@
+use objparse::ExportTable;
+
 use crate::{
 	error::{Error, Result},
 	helpers::general::fnv1a_hash_32,
-	structures::ExportTable,
 };
 use core::mem::MaybeUninit;
 
@@ -17,35 +18,38 @@ pub fn gen_syscall_table(
 	let mut num_syscalls = 0;
 
 	// Iterate through exports which match the names of syscalls
-	exports
-		.iter_string_addr(base)
-		.filter(|(name, _)| {
-			// Our condition is - name must start with zW
-			let name = name.to_bytes();
-			let name_0 = match name.first() {
-				Some(&x) => x,
-				None => return false,
-			};
-			let name_1 = match name.get(1) {
-				Some(&x) => x,
-				None => return false,
-			};
-			if name_0 != b'Z' {
-				return false;
-			}
-			if name_1 != b'w' {
-				return false;
-			}
-			true
-		})
-		.enumerate()
-		.for_each(|(n, (name, addr))| {
-			// Turn each function name into a hash
-			let name_hash = fnv1a_hash_32(name.to_bytes());
+	unsafe {
+		exports
+			.iter_string_addr(base)
+			.filter(|(name, _)| {
+				// Our condition is - name must start with zW
+				let name = name.to_bytes();
+				let name_0 = match name.first() {
+					Some(&x) => x,
+					None => return false,
+				};
+				let name_1 = match name.get(1) {
+					Some(&x) => x,
+					None => return false,
+				};
+				if name_0 != b'Z' {
+					return false;
+				}
+				if name_1 != b'w' {
+					return false;
+				}
+				true
+			})
+			.enumerate()
+			.for_each(|(n, (name, addr))| {
+				// Turn each function name into a hash
+				let name_hash = fnv1a_hash_32(name.to_bytes());
 
-			unsafe { scratch_table.get_unchecked_mut(n).write((name_hash, addr)) };
-			num_syscalls += 1;
-		});
+				scratch_table.get_unchecked_mut(n).write((name_hash, addr));
+
+				num_syscalls += 1;
+			})
+	};
 
 	let working_slice = unsafe {
 		MaybeUninit::slice_assume_init_mut(scratch_table.get_unchecked_mut(..num_syscalls))

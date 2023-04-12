@@ -1,7 +1,4 @@
-use crate::{
-	error::{Error, Result},
-	structures::PeHeaders,
-};
+use crate::error::{Error, Result};
 use core::{
 	arch::asm,
 	ffi::CStr,
@@ -10,6 +7,7 @@ use core::{
 	sync::atomic::{compiler_fence, Ordering},
 };
 use ntapi::{ntpebteb::TEB, winapi::shared::ntdef::LIST_ENTRY};
+use objparse::PeHeaders;
 
 pub struct LinkedListPointer(*mut LIST_ENTRY);
 
@@ -188,7 +186,7 @@ pub fn find_pe_base(start: usize) -> Result<*mut u8> {
 			return Err(Error::SelfFind);
 		}
 
-		match PeHeaders::parse(aligned as _) {
+		match unsafe { PeHeaders::parse(aligned as _) } {
 			Ok(_) => break Ok(aligned as _),
 			Err(_) => aligned -= 0x1000,
 		}

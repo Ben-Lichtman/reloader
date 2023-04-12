@@ -4,11 +4,11 @@ use crate::{
 	helpers::general::{
 		ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr, LinkedListPointer,
 	},
-	structures::ExportTable,
 	LoaderContext,
 };
 use core::{ffi::CStr, mem::MaybeUninit, ptr::addr_of_mut, slice};
 use ntapi::{ntldr::LDR_DATA_TABLE_ENTRY, ntpsapi::PEB_LDR_DATA};
+use objparse::ExportTable;
 use windows_sys::Win32::Foundation::UNICODE_STRING;
 
 const LIBRARY_CONVERSION_BUFFER_SIZE: usize = 64;
@@ -112,11 +112,13 @@ pub fn find_loaded_module_by_ascii(ldr: *mut PEB_LDR_DATA, ascii: *const i8) -> 
 
 #[cfg_attr(feature = "debug", inline(never))]
 pub fn find_export_by_hash(exports: &ExportTable, base: *mut u8, hash: u32) -> Result<*mut u8> {
-	exports
-		.iter_string_addr(base)
-		.find(|(name, _)| fnv1a_hash_32(name.to_bytes()) == hash)
-		.map(|(_, addr)| addr)
-		.ok_or(Error::ExportVaByHash)
+	unsafe {
+		exports
+			.iter_string_addr(base)
+			.find(|(name, _)| fnv1a_hash_32(name.to_bytes()) == hash)
+			.map(|(_, addr)| addr)
+			.ok_or(Error::ExportVaByHash)
+	}
 }
 
 #[cfg_attr(feature = "debug", inline(never))]
@@ -125,9 +127,11 @@ pub fn find_export_by_ascii(
 	base: *mut u8,
 	string: &CStr,
 ) -> Result<*mut u8> {
-	exports
-		.iter_string_addr(base)
-		.find(|(name, _)| ascii_ascii_eq(name.to_bytes(), string.to_bytes()))
-		.map(|(_, addr)| addr)
-		.ok_or(Error::ExportVaByAscii)
+	unsafe {
+		exports
+			.iter_string_addr(base)
+			.find(|(name, _)| ascii_ascii_eq(name.to_bytes(), string.to_bytes()))
+			.map(|(_, addr)| addr)
+			.ok_or(Error::ExportVaByAscii)
+	}
 }
