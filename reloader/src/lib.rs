@@ -1,8 +1,6 @@
-#![no_std]
-#![feature(slice_split_at_unchecked)]
+#![feature(maybe_uninit_uninit_array_transpose)]
 #![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(const_char_from_u32_unchecked)]
+#![no_std]
 
 mod error;
 mod function_wrappers;
@@ -14,51 +12,45 @@ use crate::{
 	function_wrappers::{allocate_memory, flush_instruction_cache, protect_memory},
 	helpers::{
 		general::{
-			find_pe_base, fnv1a_hash_32, fnv1a_hash_32_wstr, get_ip, get_teb, memset_uninit_array,
-			simple_memcpy,
+			find_pe_base, fnv1a_hash_32, get_ip, get_teb, memset_uninit_array, simple_memcpy,
 		},
 		library::{
 			find_export_by_ascii, find_export_by_hash, find_loaded_module_by_hash, get_library_base,
 		},
-		syscall::{find_syscall_by_hash, gen_syscall_table, SYSCALL_TABLE_SIZE},
+		syscall::{SYSCALL_TABLE_SIZE, find_syscall_by_hash, gen_syscall_table},
 	},
 };
 use core::{
 	arch::asm,
 	ffi::CStr,
-	mem::{size_of, transmute, MaybeUninit},
+	mem::{MaybeUninit, size_of, transmute},
 	ptr::{addr_of_mut, null_mut},
 	slice,
 	str::from_utf8_unchecked,
 };
-use ntapi::{
-	ntpebteb::TEB,
-	ntpsapi::PEB_LDR_DATA,
-	winapi::um::winnt::{DLL_PROCESS_ATTACH, PAGE_NOACCESS},
-};
 use object::{
+	LittleEndian,
 	pe::{
-		ImageThunkData64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_REL_BASED_ABSOLUTE,
-		IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
-		IMAGE_SCN_MEM_WRITE,
+		IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64,
+		IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+		ImageThunkData64,
 	},
 	read::pe::{ImageNtHeaders, ImageOptionalHeader, ImageThunkData},
-	LittleEndian,
 };
 use objparse::PeHeaders;
-use wchar::wch;
-use windows_sys::Win32::{
-	Foundation::UNICODE_STRING,
-	System::Memory::{
+use phnt::ffi::{PEB_LDR_DATA, TEB, UNICODE_STRING};
+use windows_sys::Win32::System::{
+	Memory::{
 		PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
-		PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+		PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 	},
+	SystemServices::DLL_PROCESS_ATTACH,
 };
 
 // Abusing fnv1a hash to find the strings we're looking for
 // Can't just do a string comparison because the segments aren't properly loaded yet
 
-const NTDLL_HASH: u32 = fnv1a_hash_32_wstr(wch!("ntdll.dll"));
+const NTDLL_HASH: u32 = fnv1a_hash_32("ntdll.dll".as_bytes());
 
 const ZWFLUSHINSTRUCTIONCACHE_HASH: u32 = fnv1a_hash_32("ZwFlushInstructionCache".as_bytes());
 const ZWALLOCATEVIRTUALMEMORY_HASH: u32 = fnv1a_hash_32("ZwAllocateVirtualMemory".as_bytes());
@@ -91,7 +83,7 @@ pub struct LoaderContext {
 	get_tick_count: unsafe extern "system" fn() -> u32,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader(reserved: usize) {
 	match reflective_loader_impl(reserved, false) {
@@ -100,7 +92,7 @@ pub extern "system" fn reflective_loader(reserved: usize) {
 	}
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg_attr(feature = "debug", inline(never))]
 pub extern "system" fn reflective_loader_wow64(reserved: usize) {
 	unsafe {
@@ -110,8 +102,8 @@ pub extern "system" fn reflective_loader_wow64(reserved: usize) {
 			"mov ebp, esp",
 			"and esp, 0xfffffff0",
 			"push 0x33",
-			"call 1f",
-			"1:",
+			"call 1337f",
+			"1337:",
 			"add dword ptr [esp], 5",
 			"retf",
 			".code64",
@@ -122,8 +114,8 @@ pub extern "system" fn reflective_loader_wow64(reserved: usize) {
 		}
 		asm!(
 			".code64",
-			"call 1f",
-			"1:",
+			"call 1337f",
+			"1337:",
 			"mov dword ptr [rsp + 4], 0x23",
 			"add dword ptr [rsp], 0xd",
 			"retf",
@@ -177,7 +169,7 @@ fn reflective_loader_impl(reserved: usize, wow64: bool) -> Result<()> {
 
 	// Call entry point
 	let entry_point_callable =
-		unsafe { transmute::<_, unsafe extern "system" fn(usize, u32, usize)>(entry_point) };
+		unsafe { transmute::<*mut u8, unsafe extern "system" fn(usize, u32, usize)>(entry_point) };
 
 	unsafe { entry_point_callable(allocated_ptr as _, DLL_PROCESS_ATTACH, reserved) };
 
@@ -190,9 +182,10 @@ fn fixup_wow64_pre(important_structures: &ImportantStructures, context: &LoaderC
 	// Some dependencies will conflict with the 32 bit environment, but we will just assume that everything is fine here.
 	// Ideally we'd be reimplementing some actual NTDLL functionality rather than these easy hacks
 
+	let teb = unsafe { &mut (*important_structures.teb) };
+
 	// Initialize thread activation context
 	let tick_count = unsafe { (context.get_tick_count)() };
-	let teb = unsafe { &mut (*important_structures.teb) };
 	let context_stack = &mut teb.ActivationStack;
 	context_stack.StackId = tick_count;
 	context_stack.NextCookieSequenceNumber = 1;
@@ -239,7 +232,7 @@ fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 	let ntdll_export_table = unsafe { ntdll.export_table_mem(ntdll_base) }?;
 
 	// Create the syscall table
-	let mut syscall_table = MaybeUninit::uninit_array::<SYSCALL_TABLE_SIZE>();
+	let mut syscall_table = MaybeUninit::<[u32; SYSCALL_TABLE_SIZE]>::uninit().transpose();
 	let syscall_table = memset_uninit_array(&mut syscall_table, 0);
 	gen_syscall_table(&ntdll_export_table, ntdll_base, syscall_table);
 
@@ -260,12 +253,12 @@ fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 	let ldrloaddll = find_export_by_hash(&ntdll_export_table, ntdll_base, LDRLOADDLL_HASH)?;
 	let ldrloaddll = unsafe {
 		transmute::<
-			_,
+			*mut u8,
 			unsafe extern "system" fn(
-				DllPath: *const u16,
-				DllCharacteristics: *const u32,
-				DllName: *const UNICODE_STRING,
-				DllHandle: *mut *mut u8,
+				*const u16,
+				*const u32,
+				*const phnt::ffi::UNICODE_STRING,
+				*mut *mut u8,
 			) -> i32,
 		>(ldrloaddll)
 	};
@@ -275,7 +268,9 @@ fn get_context(ntdll_base: *mut u8) -> Result<LoaderContext> {
 	let context = LoaderContext {
 		syscall_numbers,
 		ldr_load_dll: ldrloaddll,
-		get_tick_count: unsafe { transmute(get_tick_count) },
+		get_tick_count: unsafe {
+			transmute::<*mut u8, unsafe extern "system" fn() -> u32>(get_tick_count)
+		},
 	};
 	Ok(context)
 }

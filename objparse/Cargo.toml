@@ -1,0 +1,13 @@
+[package]
+name = "objparse"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["debug"]
+debug = []
+
+[dependencies]
+thiserror = { workspace = true }
+object = { workspace = true }
+windows-sys = { workspace = true }

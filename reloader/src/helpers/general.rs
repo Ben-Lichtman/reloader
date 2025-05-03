@@ -2,12 +2,13 @@ use crate::error::{Error, Result};
 use core::{
 	arch::asm,
 	ffi::CStr,
-	mem::{transmute, MaybeUninit},
+	mem::{MaybeUninit, transmute},
+	ptr,
 	ptr::null_mut,
-	sync::atomic::{compiler_fence, Ordering},
+	sync::atomic::{Ordering, compiler_fence},
 };
-use ntapi::{ntpebteb::TEB, winapi::shared::ntdef::LIST_ENTRY};
 use objparse::PeHeaders;
+use phnt::ffi::{LIST_ENTRY, TEB};
 
 pub struct LinkedListPointer(*mut LIST_ENTRY);
 
@@ -32,7 +33,7 @@ impl LinkedListPointer {
 		}
 		let cur = self.0;
 		let next = unsafe { (*self.0).Flink };
-		if next == finish {
+		if ptr::eq(next, finish) {
 			self.0 = null_mut();
 		}
 		else {
@@ -47,7 +48,7 @@ impl LinkedListPointer {
 		}
 		let cur = self.0;
 		let prev = unsafe { (*self.0).Blink };
-		if prev == finish {
+		if ptr::eq(prev, finish) {
 			self.0 = null_mut();
 		}
 		else {

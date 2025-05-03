@@ -1,11 +1,12 @@
 use crate::{
+	SyscallNumbers,
 	error::{Error, Result},
 	syscall::{syscall3, syscall5, syscall6},
-	SyscallNumbers,
 };
 use core::ptr::null_mut;
+use phnt::ffi::UNICODE_STRING;
 use windows_sys::Win32::{
-	Foundation::{STATUS_SUCCESS, UNICODE_STRING},
+	Foundation::STATUS_SUCCESS,
 	System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_PROTECTION_FLAGS, PAGE_READWRITE},
 };
 

@@ -1,15 +1,18 @@
 use crate::{
+	LoaderContext,
 	error::{Error, Result},
 	function_wrappers::load_dll,
 	helpers::general::{
-		ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr, LinkedListPointer,
+		LinkedListPointer, ascii_ascii_eq, ascii_wstr_eq, fnv1a_hash_32, fnv1a_hash_32_wstr,
 	},
-	LoaderContext,
 };
-use core::{ffi::CStr, mem::MaybeUninit, ptr::addr_of_mut, slice};
-use ntapi::{ntldr::LDR_DATA_TABLE_ENTRY, ntpsapi::PEB_LDR_DATA};
+use core::{
+	ffi::CStr,
+	mem::{MaybeUninit, transmute},
+	ptr::addr_of_mut,
+};
 use objparse::ExportTable;
-use windows_sys::Win32::Foundation::UNICODE_STRING;
+use phnt::ffi::{LDR_DATA_TABLE_ENTRY, PEB_LDR_DATA, UNICODE_STRING, UNICODE_STRING64};
 
 const LIBRARY_CONVERSION_BUFFER_SIZE: usize = 64;
 
@@ -33,14 +36,17 @@ pub fn get_library_base(
 					wchar.write(ascii as u16);
 				});
 
-			let unicode_string = UNICODE_STRING {
+			let unicode_string = UNICODE_STRING64 {
 				Length: (name_ascii.to_bytes().len() * 2) as _,
 				MaximumLength: (name_ascii.to_bytes_with_nul().len() * 2) as _,
 				Buffer: MaybeUninit::slice_as_ptr(&buffer_space) as _,
 			};
 
+			let unicode_string =
+				unsafe { transmute::<UNICODE_STRING64, UNICODE_STRING>(unicode_string) };
+
 			// Now load the library
-			load_dll(context.ldr_load_dll, &unicode_string as _)?
+			load_dll(context.ldr_load_dll, &raw const unicode_string)?
 		}
 	};
 	if loaded_library_base.is_null() {
@@ -63,12 +69,9 @@ pub fn find_loaded_module_by_hash(ldr: *mut PEB_LDR_DATA, hash: u32) -> Result<*
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
 		// Make a slice of wchars from the base name
-		let dll_name = ldr_data.BaseDllName;
-		let buffer = dll_name.Buffer;
-		if buffer.is_null() {
-			break;
-		}
-		let dll_name_wstr = unsafe { slice::from_raw_parts(buffer, dll_name.Length as usize / 2) };
+		let dll_name = &ldr_data.BaseDllName;
+
+		let dll_name_wstr = dll_name.as_slice();
 
 		if fnv1a_hash_32_wstr(dll_name_wstr) == hash {
 			// Return the base address for this DLL
@@ -95,12 +98,9 @@ pub fn find_loaded_module_by_ascii(ldr: *mut PEB_LDR_DATA, ascii: *const i8) -> 
 		let ldr_data = unsafe { &*ldr_data_ptr };
 
 		// Make a slice of wchars from the base name
-		let dll_name = ldr_data.BaseDllName;
-		let buffer = dll_name.Buffer;
-		if buffer.is_null() {
-			break;
-		}
-		let dll_name_wstr = unsafe { slice::from_raw_parts(buffer, dll_name.Length as usize / 2) };
+		let dll_name = &ldr_data.BaseDllName;
+
+		let dll_name_wstr = dll_name.as_slice();
 
 		if ascii_wstr_eq(ascii, dll_name_wstr) {
 			// Return the base address for this DLL

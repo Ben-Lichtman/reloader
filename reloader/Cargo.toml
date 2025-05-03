@@ -1,0 +1,15 @@
+[package]
+name = "reloader"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["debug"]
+debug = ["objparse/debug"]
+
+[dependencies]
+objparse = { path = "../objparse" }
+thiserror = { workspace = true }
+object = { workspace = true }
+windows-sys = { workspace = true }
+phnt = { workspace = true }

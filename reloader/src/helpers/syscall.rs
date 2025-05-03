@@ -51,9 +51,8 @@ pub fn gen_syscall_table(
 			})
 	};
 
-	let working_slice = unsafe {
-		MaybeUninit::slice_assume_init_mut(scratch_table.get_unchecked_mut(..num_syscalls))
-	};
+	let working_slice =
+		unsafe { <[_]>::assume_init_mut(scratch_table.get_unchecked_mut(..num_syscalls)) };
 	// Sort the filled entries by address
 	working_slice.sort_unstable_by_key(|(_, addr)| *addr);
 
